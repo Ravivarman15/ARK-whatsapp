@@ -1,0 +1,33 @@
+# render.yaml — Infrastructure-as-Code for Render deployment
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: ark-ai-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: SUPABASE_URL
+        sync: false          # Set manually in Render dashboard
+      - key: SUPABASE_KEY
+        sync: false
+      - key: HF_API_TOKEN
+        sync: false
+      - key: LLM_MODEL
+        value: Qwen/Qwen2.5-72B-Instruct
+      - key: AISENSY_API_KEY
+        sync: false
+      - key: AISENSY_PROJECT_ID
+        sync: false
+      - key: AISENSY_CAMPAIGN_NAME
+        sync: false
+      - key: ADMIN_WHATSAPP_NUMBER
+        sync: false
+      - key: ZAPIER_WEBHOOK_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
