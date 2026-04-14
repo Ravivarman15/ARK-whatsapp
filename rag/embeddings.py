@@ -1,15 +1,17 @@
 """
 rag/embeddings.py
 ─────────────────
-Embedding generation via HuggingFace Inference API.
+Embedding generation via HuggingFace InferenceClient.
 
-Uses `BAAI/bge-small-en-v1.5` (384-dim) via the HuggingFace Inference
-API.  No local model is loaded — keeps RAM under 512 MB on Render.
+Uses `BAAI/bge-small-en-v1.5` (384-dim) via the huggingface_hub
+InferenceClient.  The old raw api-inference.huggingface.co endpoint
+is deprecated (410 Gone) — InferenceClient handles routing automatically.
+
+No local model is loaded — keeps RAM under 512 MB on Render.
 
 Both sync and async interfaces are provided so that:
   - The FastAPI async endpoints use `get_embedding()` / `get_embeddings()`
-  - CLI scripts (ingest) can call `embed_query()` / `embed_texts()` via
-    `asyncio.run()` wrappers.
+  - CLI scripts (ingest) can call `embed_query()` / `embed_texts()` directly.
 """
 
 from __future__ import annotations
@@ -17,63 +19,55 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Optional
 
-import httpx
+from huggingface_hub import InferenceClient
 
 logger = logging.getLogger("ark.embeddings")
 
 # ── Configuration ─────────────────────────────────────────────────────
-HF_API_URL = (
-    "https://api-inference.huggingface.co/models/"
-    "BAAI/bge-small-en-v1.5"
-)
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 2.0          # seconds — doubles each retry
-_REQUEST_TIMEOUT = 30.0       # seconds per request
-_BATCH_SIZE = 64              # texts per API call (HF limit ≈ 128)
 
-# ── Shared httpx AsyncClient (connection-pooled, reused) ──────────────
-_client: Optional[httpx.AsyncClient] = None
+# ── Shared InferenceClient (singleton) ────────────────────────────────
+_client: Optional[InferenceClient] = None
 
 
-def _get_headers() -> dict[str, str]:
-    """Build authorisation headers from env."""
-    token = os.getenv("HF_API_TOKEN", "")
-    if not token:
-        # Fallback: try pydantic settings (imported lazily to avoid circular deps)
-        try:
-            from config.settings import get_settings
-            token = get_settings().HF_API_TOKEN
-        except Exception:
-            pass
-    return {"Authorization": f"Bearer {token}"}
-
-
-async def _get_client() -> httpx.AsyncClient:
-    """Return a lazily-created, long-lived async HTTP client."""
+def _get_client() -> InferenceClient:
+    """Return a lazily-created, long-lived InferenceClient."""
     global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(_REQUEST_TIMEOUT),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    if _client is None:
+        token = os.getenv("HF_API_TOKEN", "")
+        if not token:
+            # Fallback: try pydantic settings (imported lazily to avoid circular deps)
+            try:
+                from config.settings import get_settings
+                token = get_settings().HF_API_TOKEN
+            except Exception:
+                pass
+        _client = InferenceClient(
+            provider="hf-inference",
+            api_key=token,
+        )
+        logger.info(
+            "HuggingFace InferenceClient initialised | model=%s",
+            EMBEDDING_MODEL,
         )
     return _client
 
 
 async def close_client() -> None:
-    """Gracefully close the shared httpx client (call at shutdown)."""
-    global _client
-    if _client is not None and not _client.is_closed:
-        await _client.aclose()
-        _client = None
+    """No-op kept for backward compatibility with lifespan handler."""
+    pass
 
 
 # =====================================================================
-# Core async functions
+# Core sync functions (InferenceClient is synchronous)
 # =====================================================================
 
-async def get_embedding(text: str) -> list[float]:
+def _embed_single(text: str) -> list[float]:
     """
     Generate an embedding for a single text string.
 
@@ -87,81 +81,52 @@ async def get_embedding(text: str) -> list[float]:
         RuntimeError: If all retries are exhausted.
     """
     logger.info("EMBEDDING_REQUEST | single text (%d chars)", len(text))
-    client = await _get_client()
-    headers = _get_headers()
+    client = _get_client()
     last_error: Optional[Exception] = None
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            response = await client.post(
-                HF_API_URL,
-                headers=headers,
-                json={"inputs": text},
+            result = client.feature_extraction(
+                text,
+                model=EMBEDDING_MODEL,
             )
-            response.raise_for_status()
-            data = response.json()
 
-            # HF sometimes returns {"error": "Model is loading..."} with HTTP 200
-            if isinstance(data, dict) and "error" in data:
-                err_msg = data["error"]
-                estimated = data.get("estimated_time", 2)
-                logger.warning(
-                    "EMBEDDING_ERROR | model loading on attempt %d/%d: %s (est %.1fs)",
-                    attempt, _MAX_RETRIES, err_msg, estimated,
-                )
-                last_error = RuntimeError(f"HF API body error: {err_msg}")
-                if attempt < _MAX_RETRIES:
-                    wait = max(_RETRY_BACKOFF, estimated)
-                    logger.info("Retrying in %.1fs …", wait)
-                    await asyncio.sleep(wait)
-                continue
+            # result can be: numpy array, nested list, or flat list
+            if hasattr(result, "tolist"):
+                embedding = result.tolist()
+            elif isinstance(result, list):
+                embedding = result
+            else:
+                embedding = list(result)
 
-            # The API returns [[float, …]] for a single input
-            embedding: list[float] = data[0] if isinstance(data[0], list) else data
+            # Flatten if nested [[...]]
+            if embedding and isinstance(embedding[0], list):
+                embedding = embedding[0]
+
             logger.info("EMBEDDING_SUCCESS | single | dim=%d", len(embedding))
             return embedding
 
-        except httpx.TimeoutException as exc:
-            last_error = exc
-            logger.warning(
-                "EMBEDDING_ERROR | timeout on attempt %d/%d: %s",
-                attempt, _MAX_RETRIES, exc,
-            )
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            status = exc.response.status_code
-            # 503 = model loading, 429 = rate limit, 410 = stale endpoint → retry
-            if status in (410, 429, 503):
-                logger.warning(
-                    "EMBEDDING_ERROR | HTTP %d on attempt %d/%d — retrying",
-                    status, attempt, _MAX_RETRIES,
-                )
-            else:
-                logger.error("EMBEDDING_ERROR | HTTP %d — not retryable", status)
-                raise RuntimeError(f"HuggingFace API error {status}: {exc}") from exc
         except Exception as exc:
             last_error = exc
-            logger.error(
-                "EMBEDDING_ERROR | unexpected error on attempt %d/%d: %s",
+            logger.warning(
+                "EMBEDDING_ERROR | attempt %d/%d: %s",
                 attempt, _MAX_RETRIES, exc,
             )
-
-        if attempt < _MAX_RETRIES:
-            wait = _RETRY_BACKOFF * (2 ** (attempt - 1))
-            logger.info("Retrying in %.1fs …", wait)
-            await asyncio.sleep(wait)
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.info("Retrying in %.1fs …", wait)
+                time.sleep(wait)
 
     raise RuntimeError(
         f"Embedding failed after {_MAX_RETRIES} retries: {last_error}"
     )
 
 
-async def get_embeddings(texts: list[str]) -> list[list[float]]:
+def _embed_batch(texts: list[str]) -> list[list[float]]:
     """
     Generate embeddings for a batch of texts.
 
-    Sends texts in batches via the HF API.  Falls back to sequential
-    calls if the batch request fails.
+    Processes texts sequentially through the InferenceClient.
 
     Args:
         texts: List of text chunks to embed.
@@ -173,89 +138,18 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
         return []
 
     logger.info("EMBEDDING_REQUEST | batch of %d texts", len(texts))
-    client = await _get_client()
-    headers = _get_headers()
     all_embeddings: list[list[float]] = []
 
-    for batch_start in range(0, len(texts), _BATCH_SIZE):
-        batch = texts[batch_start : batch_start + _BATCH_SIZE]
-        last_error: Optional[Exception] = None
-        success = False
+    for i, text in enumerate(texts):
+        emb = _embed_single(text)
+        all_embeddings.append(emb)
 
-        for attempt in range(1, _MAX_RETRIES + 1):
-            try:
-                response = await client.post(
-                    HF_API_URL,
-                    headers=headers,
-                    json={"inputs": batch},
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                # HF sometimes returns {"error": ...} with HTTP 200
-                if isinstance(data, dict) and "error" in data:
-                    err_msg = data["error"]
-                    estimated = data.get("estimated_time", 2)
-                    logger.warning(
-                        "EMBEDDING_ERROR | batch model loading attempt %d/%d: %s",
-                        attempt, _MAX_RETRIES, err_msg,
-                    )
-                    last_error = RuntimeError(f"HF API body error: {err_msg}")
-                    if attempt < _MAX_RETRIES:
-                        wait = max(_RETRY_BACKOFF, estimated)
-                        await asyncio.sleep(wait)
-                    continue
-
-                # data is [[float, …], [float, …], …]
-                all_embeddings.extend(data)
-                logger.info(
-                    "EMBEDDING_SUCCESS | batch %d–%d of %d",
-                    batch_start + 1,
-                    min(batch_start + _BATCH_SIZE, len(texts)),
-                    len(texts),
-                )
-                success = True
-                break
-
-            except httpx.TimeoutException as exc:
-                last_error = exc
-                logger.warning(
-                    "EMBEDDING_ERROR | batch timeout attempt %d/%d",
-                    attempt, _MAX_RETRIES,
-                )
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                status = exc.response.status_code
-                if status in (410, 429, 503):
-                    logger.warning(
-                        "EMBEDDING_ERROR | batch HTTP %d attempt %d/%d",
-                        status, attempt, _MAX_RETRIES,
-                    )
-                else:
-                    logger.error("EMBEDDING_ERROR | batch HTTP %d — aborting", status)
-                    raise RuntimeError(
-                        f"HuggingFace API error {status}: {exc}"
-                    ) from exc
-            except Exception as exc:
-                last_error = exc
-                logger.error(
-                    "EMBEDDING_ERROR | batch unexpected error attempt %d/%d: %s",
-                    attempt, _MAX_RETRIES, exc,
-                )
-
-            if attempt < _MAX_RETRIES:
-                wait = _RETRY_BACKOFF * (2 ** (attempt - 1))
-                await asyncio.sleep(wait)
-
-        if not success:
-            # Fallback: try one-by-one for this batch
-            logger.warning(
-                "Batch request failed — falling back to sequential for %d texts",
-                len(batch),
+        # Progress logging every 10 texts
+        if (i + 1) % 10 == 0:
+            logger.info(
+                "EMBEDDING_PROGRESS | %d/%d texts embedded",
+                i + 1, len(texts),
             )
-            for text in batch:
-                emb = await get_embedding(text)
-                all_embeddings.append(emb)
 
     logger.info(
         "EMBEDDING_SUCCESS | total=%d embeddings (dim=%d)",
@@ -266,44 +160,36 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
 
 
 # =====================================================================
+# Async wrappers (for FastAPI endpoints)
+# =====================================================================
+
+async def get_embedding(text: str) -> list[float]:
+    """Async wrapper — offloads sync InferenceClient call to a thread."""
+    return await asyncio.to_thread(_embed_single, text)
+
+
+async def get_embeddings(texts: list[str]) -> list[list[float]]:
+    """Async wrapper — offloads sync batch embedding to a thread."""
+    return await asyncio.to_thread(_embed_batch, texts)
+
+
+# =====================================================================
 # Sync wrappers (for CLI scripts & the sync retriever path)
 # =====================================================================
 
 def embed_query(query: str) -> list[float]:
     """
-    Synchronous wrapper around `get_embedding()`.
+    Synchronous embedding for a single query.
 
     Used by the retriever's sync `ask()` function.
     """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # We're inside an already-running event loop (e.g. FastAPI).
-        # Create a new thread to run the coroutine.
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, get_embedding(query)).result()
-    else:
-        return asyncio.run(get_embedding(query))
+    return _embed_single(query)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Synchronous wrapper around `get_embeddings()`.
+    Synchronous embedding for multiple texts.
 
     Used by the ingest script.
     """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, get_embeddings(texts)).result()
-    else:
-        return asyncio.run(get_embeddings(texts))
+    return _embed_batch(texts)

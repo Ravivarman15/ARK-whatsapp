@@ -117,7 +117,11 @@ def chunk_text(
         if chunk:
             chunks.append(chunk)
 
-        start = end - chunk_overlap if end < text_len else text_len
+        # Ensure start always advances (prevent infinite loop)
+        next_start = end - chunk_overlap if end < text_len else text_len
+        if next_start <= start:
+            next_start = start + 1
+        start = next_start
 
     return chunks
 
