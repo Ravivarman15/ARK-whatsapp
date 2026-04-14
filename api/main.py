@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
-from rag.embeddings import get_embedding_model
+from rag.embeddings import close_client as close_embedding_client
 from rag.retriever import ask_async
 from rag.escalation import (
     detect_human_request, detect_complaint, notify_admin,
@@ -101,14 +101,14 @@ logger = logging.getLogger("ark.api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load the embedding model and start background jobs at startup."""
+    """Start background jobs at startup; clean up at shutdown."""
     logger.info("Starting ARK AI Bot ...")
-    get_embedding_model()  # warm-up
-    logger.info("Embedding model ready.")
+    logger.info("Using HuggingFace Inference API for embeddings (no local model).")
     start_followup_scheduler()
     logger.info("Server is live.")
     yield
     stop_followup_scheduler()
+    await close_embedding_client()
     logger.info("Shutting down ARK AI Bot.")
 
 
