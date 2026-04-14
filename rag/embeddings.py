@@ -3,9 +3,8 @@ rag/embeddings.py
 ─────────────────
 Embedding generation via HuggingFace Inference API.
 
-Uses the same `all-MiniLM-L6-v2` model as before, but calls the
-HuggingFace feature-extraction pipeline remotely instead of loading
-the model into memory.  This keeps RAM usage under 512 MB on Render.
+Uses `BAAI/bge-small-en-v1.5` (384-dim) via the HuggingFace Inference
+API.  No local model is loaded — keeps RAM under 512 MB on Render.
 
 Both sync and async interfaces are provided so that:
   - The FastAPI async endpoints use `get_embedding()` / `get_embeddings()`
@@ -27,7 +26,7 @@ logger = logging.getLogger("ark.embeddings")
 # ── Configuration ─────────────────────────────────────────────────────
 HF_API_URL = (
     "https://api-inference.huggingface.co/models/"
-    "sentence-transformers/all-MiniLM-L6-v2"
+    "BAAI/bge-small-en-v1.5"
 )
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 2.0          # seconds — doubles each retry
