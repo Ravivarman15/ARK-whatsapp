@@ -87,7 +87,7 @@ async def get_embedding(text: str) -> list[float]:
     Raises:
         RuntimeError: If all retries are exhausted.
     """
-    logger.debug("EMBEDDING_REQUEST | single text (%d chars)", len(text))
+    logger.info("EMBEDDING_REQUEST | single text (%d chars)", len(text))
     client = await _get_client()
     headers = _get_headers()
     last_error: Optional[Exception] = None
@@ -101,6 +101,21 @@ async def get_embedding(text: str) -> list[float]:
             )
             response.raise_for_status()
             data = response.json()
+
+            # HF sometimes returns {"error": "Model is loading..."} with HTTP 200
+            if isinstance(data, dict) and "error" in data:
+                err_msg = data["error"]
+                estimated = data.get("estimated_time", 2)
+                logger.warning(
+                    "EMBEDDING_ERROR | model loading on attempt %d/%d: %s (est %.1fs)",
+                    attempt, _MAX_RETRIES, err_msg, estimated,
+                )
+                last_error = RuntimeError(f"HF API body error: {err_msg}")
+                if attempt < _MAX_RETRIES:
+                    wait = max(_RETRY_BACKOFF, estimated)
+                    logger.info("Retrying in %.1fs …", wait)
+                    await asyncio.sleep(wait)
+                continue
 
             # The API returns [[float, …]] for a single input
             embedding: list[float] = data[0] if isinstance(data[0], list) else data
@@ -177,6 +192,20 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
                 )
                 response.raise_for_status()
                 data = response.json()
+
+                # HF sometimes returns {"error": ...} with HTTP 200
+                if isinstance(data, dict) and "error" in data:
+                    err_msg = data["error"]
+                    estimated = data.get("estimated_time", 2)
+                    logger.warning(
+                        "EMBEDDING_ERROR | batch model loading attempt %d/%d: %s",
+                        attempt, _MAX_RETRIES, err_msg,
+                    )
+                    last_error = RuntimeError(f"HF API body error: {err_msg}")
+                    if attempt < _MAX_RETRIES:
+                        wait = max(_RETRY_BACKOFF, estimated)
+                        await asyncio.sleep(wait)
+                    continue
 
                 # data is [[float, …], [float, …], …]
                 all_embeddings.extend(data)

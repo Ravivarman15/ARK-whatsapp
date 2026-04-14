@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -157,6 +157,47 @@ class AskResponse(BaseModel):
     """AI-generated answer."""
     answer: str = Field(
         ..., description="The AI-generated answer grounded in the document.",
+    )
+    error: Optional[str] = Field(
+        default=None,
+        description="Error detail if the request failed.",
+    )
+
+
+class WhatsAppPayload(BaseModel):
+    """Incoming AiSensy WhatsApp webhook payload.
+
+    The outer structure wraps a flexible `data` dict that contains
+    the nested `message` object from AiSensy.  Using `dict` for `data`
+    keeps compatibility with all AiSensy payload variants while giving
+    Swagger a proper request-body schema.
+
+    Example::
+
+        {
+          "data": {
+            "message": {
+              "phone_number": "919999999999",
+              "userName": "Test",
+              "message_type": "TEXT",
+              "message_content": { "text": "hello" }
+            }
+          }
+        }
+    """
+    data: dict[str, Any] = Field(
+        ...,
+        description="AiSensy webhook data containing the message object.",
+        json_schema_extra={
+            "example": {
+                "message": {
+                    "phone_number": "919999999999",
+                    "userName": "Test",
+                    "message_type": "TEXT",
+                    "message_content": {"text": "hello"},
+                }
+            }
+        },
     )
 
 
@@ -317,23 +358,30 @@ async def health():
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(body: AskRequest):
     """Accept a user question, run the RAG pipeline, and return an answer."""
+    logger.info("ASK_REQUEST | user=%s | question=\"%s\"", body.user_id, body.question[:120])
     try:
         answer = await ask_async(
             question=body.question,
             user_id=body.user_id or "anonymous",
         )
+        logger.info("ASK_SUCCESS | answer_len=%d", len(answer))
         return AskResponse(answer=answer)
     except Exception as e:
-        logger.exception("Error in /ask endpoint")
+        logger.exception("ASK_ERROR | %s", e)
         return AskResponse(
-            answer="Sorry, I am facing a temporary issue. Please try again."
+            answer="Sorry, I am facing a temporary issue. Please try again.",
+            error=str(e),
         )
 
 
 @app.post("/whatsapp")
-async def whatsapp_webhook(request: Request):
+async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = None):
     """
     AiSensy WhatsApp webhook with full intelligent lead pipeline.
+
+    Accepts either:
+      - A typed ``WhatsAppPayload`` JSON body (preferred — shows in Swagger)
+      - A raw ``Request`` body (fallback for non-standard AiSensy shapes)
 
     Flow:
       1. Extract message, phone, name from payload
@@ -349,7 +397,11 @@ async def whatsapp_webhook(request: Request):
     """
     phone = ""  # Pre-init so fallback in except block can reference it
     try:
-        payload = await request.json()
+        # Use typed body if available, fall back to raw request parsing
+        if body is not None:
+            payload = {"data": body.data}
+        else:
+            payload = await request.json()
         logger.info("WEBHOOK_RECEIVED | payload_keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
 
         message, phone, user_name, message_type = _extract_from_payload(payload)
