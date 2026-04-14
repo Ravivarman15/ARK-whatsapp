@@ -325,7 +325,9 @@ async def ask_endpoint(body: AskRequest):
         return AskResponse(answer=answer)
     except Exception as e:
         logger.exception("Error in /ask endpoint")
-        raise HTTPException(status_code=500, detail=str(e))
+        return AskResponse(
+            answer="Sorry, I am facing a temporary issue. Please try again."
+        )
 
 
 @app.post("/whatsapp")

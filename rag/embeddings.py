@@ -26,11 +26,11 @@ logger = logging.getLogger("ark.embeddings")
 
 # ── Configuration ─────────────────────────────────────────────────────
 HF_API_URL = (
-    "https://api-inference.huggingface.co/pipeline/feature-extraction/"
+    "https://api-inference.huggingface.co/models/"
     "sentence-transformers/all-MiniLM-L6-v2"
 )
 _MAX_RETRIES = 3
-_RETRY_BACKOFF = 1.5          # seconds — doubles each retry
+_RETRY_BACKOFF = 2.0          # seconds — doubles each retry
 _REQUEST_TIMEOUT = 30.0       # seconds per request
 _BATCH_SIZE = 64              # texts per API call (HF limit ≈ 128)
 
@@ -116,8 +116,8 @@ async def get_embedding(text: str) -> list[float]:
         except httpx.HTTPStatusError as exc:
             last_error = exc
             status = exc.response.status_code
-            # 503 = model loading, 429 = rate limit → retry
-            if status in (429, 503):
+            # 503 = model loading, 429 = rate limit, 410 = stale endpoint → retry
+            if status in (410, 429, 503):
                 logger.warning(
                     "EMBEDDING_ERROR | HTTP %d on attempt %d/%d — retrying",
                     status, attempt, _MAX_RETRIES,
@@ -198,7 +198,7 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 status = exc.response.status_code
-                if status in (429, 503):
+                if status in (410, 429, 503):
                     logger.warning(
                         "EMBEDDING_ERROR | batch HTTP %d attempt %d/%d",
                         status, attempt, _MAX_RETRIES,
