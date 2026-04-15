@@ -225,8 +225,8 @@ async def send_whatsapp_message(phone: str, message: str) -> None:
         logger.warning("AISENSY_PROJECT_ID not set - skipping WhatsApp reply.")
         return
 
-    # Ensure phone has country code prefix
-    destination = phone if phone.startswith("+") else f"+{phone}"
+    # AiSensy expects bare numbers without + prefix (e.g. 917305801869)
+    destination = phone.lstrip("+")
 
     url = (
         f"https://apis.aisensy.com/project-apis/v1/"
