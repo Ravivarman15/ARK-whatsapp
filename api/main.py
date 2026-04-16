@@ -10,17 +10,13 @@ Endpoints:
 
 Features:
     - Async endpoints for low-latency responses
-    - Model pre-loading at startup
-    - Lead qualification conversation flow
+    - Smart intent routing (complaint > factual > admission > qualification > general)
+    - Lead qualification conversation flow (state machine)
+    - WhatsApp-friendly short responses (2-3 lines max)
+    - Per-user state memory via phone number
     - Lead scoring + segmentation + stage detection
-    - Multi-intent handling + high-intent interruption
-    - Parent persona detection
     - Complaint / confusion escalation
-    - Hot lead detection and admin notification
-    - Human escalation handling
-    - ADA conversion engine
-    - Psychological trigger rotation
-    - Tamil language switching
+    - Admin notification for qualified leads
     - Structured logging
     - CORS middleware
 """
@@ -47,7 +43,6 @@ from rag.escalation import (
 )
 from rag.lead_manager import (
     classify_lead,
-    detect_hot_lead,
     detect_course_interest,
     is_in_qualification,
     start_lead_qualification,
@@ -78,10 +73,8 @@ from rag.scoring import score_from_message, get_score, get_lead_type, update_sco
 from rag.stage_detector import detect_and_update_stage, get_stage
 from rag.segmentation import detect_segment_from_message
 from rag.persona_detector import detect_and_update_persona, get_persona
-from rag.intent_engine import (
-    detect_intents, detect_high_intent, is_multi_intent,
-    get_primary_intent, Intent, HIGH_INTENT_RESPONSE,
-)
+from rag.intent_router import classify_message, Route
+from rag.response_formatter import format_whatsapp_response
 
 # =====================================================================
 # Logging
@@ -377,23 +370,15 @@ async def ask_endpoint(body: AskRequest):
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = None):
     """
-    AiSensy WhatsApp webhook with full intelligent lead pipeline.
+    AiSensy WhatsApp webhook — smart admission assistant.
 
-    Accepts either:
-      - A typed ``WhatsAppPayload`` JSON body (preferred — shows in Swagger)
-      - A raw ``Request`` body (fallback for non-standard AiSensy shapes)
-
-    Flow:
-      1. Extract message, phone, name from payload
-      2. Record activity for follow-up tracking
-      3. Run intelligence engines (scoring, stage, persona)
-      4. Check high-intent interruption -> capture phone + escalate
-      5. If user is in qualification flow -> continue collecting data
-      6. Check complaint -> escalate with reason
-      7. Check hot lead intent -> notify admin immediately
-      8. Check human escalation intent -> classify + notify admin
-      9. Check course interest -> start qualification flow
-     10. Normal RAG pipeline with intelligence context
+    Intent priority (strict order):
+      1. Complaint / escalation     → escalate immediately
+      2. Human escalation request   → connect to counsellor
+      3. Factual question (RAG)     → answer ONLY, no follow-up
+      4. Admission intent           → start/resume qualification flow
+      5. Active qualification flow  → continue collecting data
+      6. General fallback           → short RAG answer
     """
     phone = ""  # Pre-init so fallback in except block can reference it
     try:
@@ -439,72 +424,29 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
             user_id, get_score(user_id), stage.value, persona.value,
         )
 
-        # ── Step 1: High-intent interruption ────────────────────────
-        if detect_high_intent(message):
-            logger.info(
-                "HIGH_INTENT_INTERRUPT | user=%s | message=\"%s\"",
-                phone, message[:80],
-            )
-            update_score(user_id, ScoreAction.ASKED_ADMISSION)
+        # ── Classify intent using the unified router ─────────────────
+        in_qual = is_in_qualification(user_id)
+        has_complaint = detect_complaint(message)
+        has_human_req = detect_human_request(message)
 
-            # Notify admin immediately
-            await notify_admin_hot_lead(
-                user_phone=phone or "unknown",
-                user_message=message,
-                lead_type="Admission Intent (HIGH PRIORITY)",
-            )
-            if phone:
-                await mark_followup_escalated(phone)
-                await send_whatsapp_message(phone, HIGH_INTENT_RESPONSE)
+        route = classify_message(
+            message,
+            is_in_qualification=in_qual,
+            has_complaint=has_complaint,
+            has_human_request=has_human_req,
+        )
 
-            logger.info("AI_RESPONSE | phone=%s | type=high_intent | response=\"%s\"", phone, HIGH_INTENT_RESPONSE[:120])
-            return {"status": "high_intent", "answer": HIGH_INTENT_RESPONSE}
+        logger.info(
+            "ROUTE | user=%s | route=%s | in_qual=%s",
+            user_id, route.value, in_qual,
+        )
 
-        # ── Step 2: Active qualification flow ───────────────────────
-        if is_in_qualification(user_id):
-            result = process_qualification_message(user_id, message)
-
-            if result is None:
-                # User asked a question mid-flow — answer via RAG + re-prompt
-                rag_answer = await ask_async(question=message, user_id=user_id)
-                current_prompt = get_current_qual_prompt(user_id)
-                reply = rag_answer + "\n\n" + current_prompt
-            else:
-                reply = result
-
-            # Check if qualification just completed
-            lead = complete_lead(user_id)
-            if lead:
-                # Update with latest intelligence
-                lead.stage = stage.value
-                lead.persona = persona.value
-
-                # Save to database and notify admin
-                await save_lead_to_db(lead)
-                await notify_admin_qualified_lead(lead)
-
-                # Send to Google Sheets via Zapier
-                try:
-                    await send_lead_to_zapier(build_lead_payload(lead, message))
-                except Exception:
-                    pass  # logged inside send_lead_to_zapier
-
-                if phone:
-                    await mark_followup_completed(phone)
-
-            if phone:
-                await send_whatsapp_message(phone, reply)
-
-            logger.info("AI_RESPONSE | phone=%s | type=qualification | response=\"%s\"", phone, reply[:120])
-            return {"status": "qualification_step", "answer": reply}
-
-        # ── Step 3: Complaint detection ─────────────────────────────
-        if detect_complaint(message):
+        # =============================================================
+        # PRIORITY 1: Complaint / Escalation
+        # =============================================================
+        if route == Route.COMPLAINT:
             lead_type = classify_lead(message).value
-            logger.info(
-                "COMPLAINT | user=%s | message=\"%s\"",
-                phone, message[:80],
-            )
+            logger.info("COMPLAINT | user=%s | message=\"%s\"", phone, message[:80])
             add_internal_flag(user_id, "COMPLAINT")
             set_concern(user_id, "Complaint / Dissatisfaction")
 
@@ -515,55 +457,19 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 lead_type=lead_type,
                 reason="Complaint / Dissatisfaction",
             )
+            reply = "We're sorry to hear that. Our team will reach out to you shortly \U0001f64f"
             if phone:
                 await mark_followup_escalated(phone)
-                await send_whatsapp_message(phone, COMPLAINT_REPLY)
+                await send_whatsapp_message(phone, reply)
 
-            logger.info("AI_RESPONSE | phone=%s | type=complaint | response=\"%s\"", phone, COMPLAINT_REPLY[:120])
-            return {"status": "complaint", "answer": COMPLAINT_REPLY}
+            return {"status": "complaint", "answer": reply}
 
-        # ── Step 4: Hot lead detection ──────────────────────────────
-        if detect_hot_lead(message):
+        # =============================================================
+        # PRIORITY 2: Human Escalation
+        # =============================================================
+        if route == Route.HUMAN_ESCALATION:
             lead_type = classify_lead(message).value
-            logger.info(
-                "HOT_LEAD | user=%s | type=%s | score=%d | message=\"%s\"",
-                phone, lead_type, get_score(user_id), message[:80],
-            )
-
-            # Notify admin immediately with HIGH priority
-            await notify_admin_hot_lead(
-                user_phone=phone or "unknown",
-                user_message=message,
-                lead_type=lead_type,
-            )
-
-            # Send to Google Sheets via Zapier
-            try:
-                await send_lead_to_zapier(build_quick_payload(
-                    phone=phone or "unknown", message=message,
-                    lead_type=lead_type, priority="HIGH",
-                    score=get_score(user_id), stage=stage.value,
-                ))
-            except Exception:
-                pass  # logged inside send_lead_to_zapier
-
-            if phone:
-                await mark_followup_escalated(phone)
-
-            # Also reply to user with escalation message
-            if phone:
-                await send_whatsapp_message(phone, ESCALATION_REPLY)
-
-            logger.info("AI_RESPONSE | phone=%s | type=hot_lead | response=\"%s\"", phone, ESCALATION_REPLY[:120])
-            return {"status": "hot_lead", "answer": ESCALATION_REPLY}
-
-        # ── Step 5: Human escalation ────────────────────────────────
-        if detect_human_request(message):
-            lead_type = classify_lead(message).value
-            logger.info(
-                "ESCALATION | user=%s | type=%s | message=\"%s\"",
-                phone, lead_type, message[:80],
-            )
+            logger.info("ESCALATION | user=%s | type=%s", phone, lead_type)
 
             await notify_admin(
                 user_phone=phone or "unknown",
@@ -572,7 +478,6 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 lead_type=lead_type,
             )
 
-            # Send to Google Sheets via Zapier
             try:
                 await send_lead_to_zapier(build_quick_payload(
                     phone=phone or "unknown", message=message,
@@ -580,60 +485,140 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                     score=get_score(user_id), stage=stage.value,
                 ))
             except Exception:
-                pass  # logged inside send_lead_to_zapier
+                pass
 
+            reply = "Our counsellor will contact you shortly \U0001f44d"
             if phone:
                 await mark_followup_escalated(phone)
+                await send_whatsapp_message(phone, reply)
+
+            return {"status": "escalated", "answer": reply}
+
+        # =============================================================
+        # PRIORITY 3: Factual Question → RAG only, NO follow-up
+        # =============================================================
+        if route == Route.FACTUAL_QUESTION:
+            # If user is mid-qualification and asks a question,
+            # answer the question then re-prompt the current step
+            if in_qual:
+                rag_answer = await ask_async(question=message, user_id=user_id)
+                rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                current_prompt = get_current_qual_prompt(user_id)
+                # Send answer and re-prompt as separate messages for clarity
+                if phone:
+                    await send_whatsapp_message(phone, rag_answer)
+                    await send_whatsapp_message(phone, current_prompt)
+                reply = rag_answer
+                logger.info("AI_RESPONSE | phone=%s | type=factual_midflow | response=\"%s\"", phone, reply[:120])
+                return {"status": "factual_midflow", "answer": reply}
+
+            # Pure factual question — answer only, no qualification trigger
+            answer = await ask_async(question=message, user_id=user_id)
+            answer = format_whatsapp_response(answer, is_factual=True)
+
+            # Check for confusion escalation
+            from rag.retriever import NO_CONTEXT_MSG
+            if answer.startswith(NO_CONTEXT_MSG[:30]):
+                confusion_count = record_confusion(user_id)
+                if should_escalate_confusion(user_id):
+                    await notify_admin(
+                        user_phone=phone or "unknown",
+                        user_message=message,
+                        user_name=user_name,
+                        lead_type="General Enquiry",
+                        reason=f"Repeated confusion ({confusion_count} unanswered)",
+                    )
+            else:
+                reset_confusion(user_id)
 
             if phone:
-                await send_whatsapp_message(phone, ESCALATION_REPLY)
+                await send_whatsapp_message(phone, answer)
 
-            logger.info("AI_RESPONSE | phone=%s | type=escalation | response=\"%s\"", phone, ESCALATION_REPLY[:120])
-            return {"status": "escalated", "answer": ESCALATION_REPLY}
+            logger.info("AI_RESPONSE | phone=%s | type=factual | response=\"%s\"", phone, answer[:120])
+            return {"status": "factual", "answer": answer}
 
-        # ── Step 6: Course interest -> start qualification ──────────
-        course = detect_course_interest(message)
-        if course:
+        # =============================================================
+        # PRIORITY 4: Admission Intent → start/resume qualification
+        # =============================================================
+        if route == Route.ADMISSION_INTENT:
+            course = detect_course_interest(message)
+            update_score(user_id, ScoreAction.ASKED_ADMISSION)
+
             logger.info(
-                "COURSE_INTEREST | user=%s | course=%s | score=%d | message=\"%s\"",
-                phone, course, get_score(user_id), message[:80],
+                "ADMISSION_INTENT | user=%s | course=%s | score=%d",
+                phone, course or "General", get_score(user_id),
             )
 
-            first_prompt = start_lead_qualification(
+            # start_lead_qualification now resumes if already active
+            qual_prompt = start_lead_qualification(
                 user_id=user_id,
                 phone=phone,
-                course=course,
+                course=course or "",
             )
 
             if phone:
-                # First send a RAG answer about the course, then start qualification
+                await send_whatsapp_message(phone, qual_prompt)
+
+            return {"status": "qualification_started", "answer": qual_prompt}
+
+        # =============================================================
+        # PRIORITY 5: Active Qualification Flow
+        # =============================================================
+        if route == Route.QUALIFICATION:
+            result = process_qualification_message(user_id, message)
+
+            if result is None:
+                # User asked a question mid-flow — answer via RAG + re-prompt
                 rag_answer = await ask_async(question=message, user_id=user_id)
-                combined_reply = rag_answer + "\n\n" + first_prompt
-                await send_whatsapp_message(phone, combined_reply)
+                rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                current_prompt = get_current_qual_prompt(user_id)
+                if phone:
+                    await send_whatsapp_message(phone, rag_answer)
+                    await send_whatsapp_message(phone, current_prompt)
+                reply = rag_answer
             else:
-                combined_reply = first_prompt
+                reply = result
+                if phone:
+                    await send_whatsapp_message(phone, reply)
 
-            return {"status": "qualification_started", "answer": combined_reply}
+            # Check if qualification just completed
+            lead = complete_lead(user_id)
+            if lead:
+                lead.stage = stage.value
+                lead.persona = persona.value
 
-        # ── Step 7: Normal RAG (with intelligence context) ──────────
+                await save_lead_to_db(lead)
+                await notify_admin_qualified_lead(lead)
+
+                try:
+                    await send_lead_to_zapier(build_lead_payload(lead, message))
+                except Exception:
+                    pass
+
+                if phone:
+                    await mark_followup_completed(phone)
+
+            logger.info("AI_RESPONSE | phone=%s | type=qualification | response=\"%s\"", phone, reply[:120])
+            return {"status": "qualification_step", "answer": reply}
+
+        # =============================================================
+        # PRIORITY 6: General Fallback → short RAG answer
+        # =============================================================
         answer = await ask_async(question=message, user_id=user_id)
+        answer = format_whatsapp_response(answer, is_factual=False)
 
-        # Check for confusion escalation (if answer is no-context)
+        # Confusion escalation
         from rag.retriever import NO_CONTEXT_MSG
         if answer.startswith(NO_CONTEXT_MSG[:30]):
             confusion_count = record_confusion(user_id)
             if should_escalate_confusion(user_id):
-                logger.info(
-                    "CONFUSION_ESCALATION | user=%s | count=%d",
-                    user_id, confusion_count,
-                )
                 add_internal_flag(user_id, "REPEATED_CONFUSION")
                 await notify_admin(
                     user_phone=phone or "unknown",
                     user_message=message,
                     user_name=user_name,
                     lead_type="General Enquiry",
-                    reason=f"Repeated confusion ({confusion_count} unanswered queries)",
+                    reason=f"Repeated confusion ({confusion_count} unanswered)",
                 )
         else:
             reset_confusion(user_id)
@@ -641,12 +626,11 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
         if phone:
             await send_whatsapp_message(phone, answer)
 
-        logger.info("AI_RESPONSE | phone=%s | type=rag | response=\"%s\"", phone, answer[:120])
+        logger.info("AI_RESPONSE | phone=%s | type=general | response=\"%s\"", phone, answer[:120])
         return {"status": "ok", "answer": answer}
 
     except Exception as e:
         logger.exception("Error in /whatsapp webhook")
-        # Send fallback message to user if we have their phone
         if phone:
             try:
                 await send_whatsapp_message(phone, FALLBACK_MESSAGE)

@@ -164,18 +164,38 @@ COURSE_KEYWORDS = {
     "class 8": "Class 8",
 }
 
+# Admission-intent keywords that must be present alongside course keywords
+# to trigger qualification (prevents false positives from factual questions)
+_ADMISSION_CONTEXT_WORDS = {
+    "join", "admission", "admit", "enroll", "enrol", "register",
+    "fees", "fee", "demo", "apply", "seat", "interested",
+    "want", "need", "looking", "start",
+}
+
 
 def detect_course_interest(message: str) -> Optional[str]:
     """
-    Detect if the user is interested in a specific course.
+    Detect if the user is interested in a specific course
+    AND has admission intent.
+
+    Only returns a course if the message also contains an
+    admission-context word — prevents triggering on pure
+    factual questions like "which school is this?"
 
     Args:
         message: The raw user message.
 
     Returns:
-        The course name if detected, None otherwise.
+        The course name if detected with intent, None otherwise.
     """
     msg = message.lower().strip()
+    words = set(msg.split())
+
+    # Must have at least one admission-context word
+    has_admission_context = bool(words & _ADMISSION_CONTEXT_WORDS)
+    if not has_admission_context:
+        return None
+
     for keyword, course in COURSE_KEYWORDS.items():
         if keyword in msg:
             return course
@@ -195,17 +215,13 @@ class QualStep(str, Enum):
     COMPLETE = "complete"
 
 
-# Prompts for each qualification step
+# Prompts for each qualification step — WhatsApp-friendly, 1-2 lines max
 QUAL_PROMPTS = {
-    QualStep.ASK_NAME: "That's great! Please share the *student's name*.",
-    QualStep.ASK_CLASS: "Thank you! *Which class* is the student currently studying in?",
-    QualStep.ASK_SCHOOL: "Got it! *Which school* is the student studying in?",
-    QualStep.ASK_PARENT_PHONE: "Almost done! Please share the *parent's phone number* so our counsellor can call.",
-    QualStep.COMPLETE: (
-        "Thank you for sharing your details! \U0001f64f\n\n"
-        "Our academic counsellor will contact you shortly to guide you through the admission process.\n\n"
-        "\u2014 Team ARK Learning Arena"
-    ),
+    QualStep.ASK_NAME: "Great! What's the student's name?",
+    QualStep.ASK_CLASS: "Which class is the student in?",
+    QualStep.ASK_SCHOOL: "Which school does the student study in?",
+    QualStep.ASK_PARENT_PHONE: "Please share a contact number so our counsellor can call.",
+    QualStep.COMPLETE: "Thanks! Our counsellor will call you shortly \U0001f44d",
 }
 
 # The order in which fields are collected
@@ -266,12 +282,30 @@ def start_lead_qualification(
     course: str = "",
 ) -> str:
     """
-    Start a new lead qualification flow for the user.
+    Start or resume a lead qualification flow for the user.
 
-    Returns the first question prompt.
+    If the user already has an active (non-timed-out) qualification,
+    resumes from the current step instead of restarting.
+
+    Returns the next question prompt.
     """
     from rag.scoring import update_score, ScoreAction, get_score, get_lead_type
 
+    # ── Resume existing flow if active ───────────────────────────
+    existing = _active_leads.get(user_id)
+    if existing is not None:
+        elapsed = time.time() - existing.started_at
+        if elapsed <= QUAL_TIMEOUT and existing.current_step != QualStep.COMPLETE:
+            # Update course if a more specific one was detected
+            if course and existing.course in ("", "General"):
+                existing.course = course
+            logger.info(
+                "LEAD_QUAL_RESUME | user=%s | step=%s | course=%s",
+                user_id, existing.current_step.value, existing.course,
+            )
+            return QUAL_PROMPTS[existing.current_step]
+
+    # ── Start new flow ───────────────────────────────────────────
     _active_leads[user_id] = LeadData(
         phone=phone,
         course=course or "General",

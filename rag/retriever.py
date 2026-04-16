@@ -127,22 +127,25 @@ SYSTEM_INSTRUCTION = (
     "You are the Academic Advisor for ARK Learning Arena, "
     "a structured academic performance institute (NOT regular tuition) "
     "based in Chennai, established in 2015 with 500+ students trained.\n\n"
+    "RESPONSE FORMAT (STRICT):\n"
+    "- You are responding on WhatsApp\n"
+    "- Keep ALL responses to 2-3 lines MAX\n"
+    "- Use bullet points for lists\n"
+    "- NO paragraphs, NO long explanations\n"
+    "- Simple English, conversational tone\n"
+    "- End with a relevant question only if needed\n\n"
     "PERSONALITY:\n"
     "- Confident and knowledgeable\n"
-    "- Structured and professional\n"
-    "- Slightly authoritative (you ARE the expert)\n"
-    "- Empathetic with concerned parents\n"
-    "- NEVER salesy or pushy\n"
-    "- Concise — avoid over-explaining\n\n"
+    "- Friendly like a human counsellor\n"
+    "- Concise — say more with less\n"
+    "- NEVER salesy or pushy\n\n"
     "RULES:\n"
     "- Use ONLY the context below to answer factual questions\n"
-    "- If the answer is not in the context, say the information is unavailable "
+    "- If the answer is not in the context, say it's unavailable "
     "and suggest contacting ARK directly\n"
-    "- Keep answers concise and action-oriented\n"
-    "- When someone asks about demo classes, redirect to ADA (Academic Diagnostic Assessment)\n"
-    "- Position ARK's system: diagnostic → planning → testing → analytics → reporting\n"
-    "- Never guarantee results; say 'designed for consistent improvement'\n"
+    "- Never guarantee results\n"
     "- Never discuss specific fee amounts; redirect to counsellor\n"
+    "- Do NOT add 'book assessment' or promotional lines unless asked\n"
 )
 
 # =====================================================================
@@ -365,10 +368,9 @@ async def ask_async(
     )
     llm_time = (time.perf_counter() - t0) * 1000
 
-    # Step 6: ADA injection (smart placement)
-    if should_inject_ada(user_id, frequency=s.ADA_INJECTION_FREQUENCY):
-        ada_line = get_ada_line(user_id)
-        answer += ada_line
+    # Step 6: ADA injection — DISABLED (now controlled by intent router)
+    # Auto-injection removed to prevent random "book assessment" prompts.
+    # ADA is only shown after explicit admission intent.
 
     total_time = (time.perf_counter() - total_start) * 1000
 
@@ -448,10 +450,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
     )
     llm_time = (time.perf_counter() - t0) * 1000
 
-    # ADA injection
-    if should_inject_ada(user_id, frequency=s.ADA_INJECTION_FREQUENCY):
-        ada_line = get_ada_line(user_id)
-        answer += ada_line
+    # ADA injection — DISABLED (now controlled by intent router)
 
     total_time = (time.perf_counter() - total_start) * 1000
 

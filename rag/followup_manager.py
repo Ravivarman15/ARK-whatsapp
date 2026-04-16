@@ -36,45 +36,27 @@ logger = logging.getLogger("ark.followup")
 
 FOLLOWUP_MESSAGES = {
     1: (
-        "Just checking — would you like to book your "
-        "Academic Diagnostic Assessment? 📚\n\n"
-        "It's free and helps us understand the student's current level.\n\n"
-        "— Team ARK Learning Arena"
+        "Hi! Just checking in \U0001f44b\n"
+        "Would you like to know more about our programs?\n"
+        "Feel free to ask any question."
     ),
     2: (
-        "We have limited slots available this week for the "
-        "assessment. 🎯\n\n"
-        "Would you like to reserve one?\n\n"
-        "Reply 'Yes' to get started or ask any question.\n\n"
-        "— Team ARK Learning Arena"
+        "We have limited slots this week \U0001f3af\n"
+        "Would you like to reserve one?\n"
+        "Reply 'Yes' to get started."
     ),
     3: (
-        "Let us know if you need any guidance. "
-        "We'll be happy to help you plan the next step. 🙏\n\n"
-        "If you prefer, we can directly schedule a quick "
-        "counselling call for you.\n\n"
-        "— Team ARK Learning Arena"
+        "Let us know if you need any help \U0001f64f\n"
+        "We can schedule a quick counselling call for you."
     ),
 }
 
 # Drop-off recovery messages (when user stops mid-qualification)
 DROPOFF_MESSAGES = {
-    "ask_name": (
-        "Hi! We noticed you were interested in our program. "
-        "Could you share the student's name so we can guide you better?"
-    ),
-    "ask_class": (
-        "Could you also share which class the student is studying in? "
-        "This helps us recommend the right program."
-    ),
-    "ask_school": (
-        "Which school is the student studying in? "
-        "We'd like to understand their current academic environment."
-    ),
-    "ask_parent_phone": (
-        "Please share a contact number so our counsellor can guide you properly. "
-        "You can share it later, but we won't be able to assist you fully without it."
-    ),
+    "ask_name": "Hi! You were interested in our program. What's the student's name?",
+    "ask_class": "Which class is the student in?",
+    "ask_school": "Which school does the student study in?",
+    "ask_parent_phone": "Please share a contact number so our counsellor can call.",
 }
 
 

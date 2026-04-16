@@ -66,18 +66,18 @@ class Settings(BaseSettings):
 
     # ── Performance ───────────────────────────────────────────────
     HF_TIMEOUT: int = 30         # Seconds before HuggingFace call times out
-    MAX_NEW_TOKENS: int = 300    # Keep generation short for speed
+    MAX_NEW_TOKENS: int = 150    # WhatsApp-friendly short responses
 
     # ── Follow-Up Automation (within 24-hour WhatsApp window) ─────
     FOLLOWUP_STAGE1_DELAY: int = 1800        # Seconds before 1st follow-up (30 min)
-    FOLLOWUP_STAGE2_DELAY: int = 18000       # Seconds before 2nd follow-up (5 hr)
-    FOLLOWUP_STAGE3_DELAY: int = 64800       # Seconds before 3rd follow-up (18 hr)
+    FOLLOWUP_STAGE2_DELAY: int = 14400       # Seconds before 2nd follow-up (4 hr)
+    FOLLOWUP_STAGE3_DELAY: int = 57600       # Seconds before 3rd follow-up (16 hr)
     FOLLOWUP_CHECK_INTERVAL: int = 60        # Seconds between scheduler runs
     MAX_FOLLOWUP_STAGE: int = 3              # Max number of follow-ups per user
 
     # ── Intelligence Engine ───────────────────────────────────────
-    ADA_INJECTION_FREQUENCY: int = 3         # Inject ADA push every N responses
-    TRIGGER_ROTATION_FREQUENCY: int = 2      # Inject psych trigger every N responses
+    ADA_INJECTION_FREQUENCY: int = 0         # Disabled — ADA only after admission intent
+    TRIGGER_ROTATION_FREQUENCY: int = 0      # Disabled — triggers only on intent match
     CONFUSION_ESCALATION_THRESHOLD: int = 3  # Escalate after N unanswered queries
 
 

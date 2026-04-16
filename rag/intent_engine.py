@@ -192,3 +192,51 @@ HIGH_INTENT_RESPONSE = (
 MULTI_INTENT_PREFIX = (
     "Great questions! Let me address them:\n\n"
 )
+
+
+# =====================================================================
+# Factual Question Detection
+# =====================================================================
+
+_FACTUAL_QUESTION_WORDS = {
+    "what", "who", "whom", "whose", "how", "why", "when", "where",
+    "which", "tell", "explain", "describe",
+}
+
+_ADMISSION_KEYWORDS = {
+    "join", "admission", "admit", "fees", "fee", "demo",
+    "course", "enroll", "enrol", "register",
+}
+
+
+def is_factual_question(message: str) -> bool:
+    """
+    Detect if a message is a pure factual/knowledge question
+    that should be answered via RAG only (no follow-up).
+
+    Returns True if the message is a question AND does NOT
+    contain admission-intent keywords.
+    """
+    msg = message.lower().strip()
+    if not msg:
+        return False
+
+    # Must look like a question
+    is_q = False
+    if "?" in msg:
+        is_q = True
+    else:
+        words = msg.split()
+        if words and words[0] in _FACTUAL_QUESTION_WORDS:
+            is_q = True
+
+    if not is_q:
+        return False
+
+    # Must NOT contain admission keywords (strip punctuation for matching)
+    import re as _re
+    msg_words = set(_re.sub(r"[^\w\s]", "", msg).split())
+    if msg_words & _ADMISSION_KEYWORDS:
+        return False
+
+    return True
