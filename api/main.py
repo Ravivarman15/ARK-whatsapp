@@ -199,7 +199,10 @@ class WhatsAppPayload(BaseModel):
 # =====================================================================
 
 MAX_SEND_RETRIES = 1  # Retry once on failure
-FALLBACK_MESSAGE = "Sorry, please try again later."
+FALLBACK_MESSAGE = "Sorry, I'm having trouble right now. Please try again in a moment."
+
+# Graceful error message when RAG pipeline fails
+RAG_ERROR_MESSAGE = "I couldn't process that right now. Please try again or ask a different question."
 
 
 async def send_whatsapp_message(phone: str, message: str) -> None:
@@ -409,20 +412,32 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
 
         # ── Record activity for follow-up tracking ──────────────────
         if phone:
-            await record_user_activity(phone)
+            try:
+                await record_user_activity(phone)
+            except Exception as e:
+                logger.error("ACTIVITY_RECORD_FAILED | phone=%s | %s", phone, e)
 
         # ── Intelligence: scoring, stage, persona ───────────────────
-        score_from_message(user_id, message)
-        stage = detect_and_update_stage(user_id, message)
-        persona = detect_and_update_persona(user_id, message)
+        # These are non-critical — if they fail, continue with defaults
+        stage = None
+        persona = None
+        try:
+            score_from_message(user_id, message)
+            stage = detect_and_update_stage(user_id, message)
+            persona = detect_and_update_persona(user_id, message)
+            update_lead_intelligence(
+                user_id,
+                stage=stage.value if stage else "",
+                persona=persona.value if persona else "",
+            )
+        except Exception as e:
+            logger.error("INTELLIGENCE_FAILED | user=%s | %s", user_id, e)
 
-        # Update lead intelligence if in qualification
-        update_lead_intelligence(user_id, stage=stage.value, persona=persona.value)
-
-        logger.info(
-            "INTELLIGENCE | user=%s | score=%d | stage=%s | persona=%s",
-            user_id, get_score(user_id), stage.value, persona.value,
-        )
+        if stage and persona:
+            logger.info(
+                "INTELLIGENCE | user=%s | score=%d | stage=%s | persona=%s",
+                user_id, get_score(user_id), stage.value, persona.value,
+            )
 
         # ── Classify intent using the unified router ─────────────────
         in_qual = is_in_qualification(user_id)
@@ -482,7 +497,7 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 await send_lead_to_zapier(build_quick_payload(
                     phone=phone or "unknown", message=message,
                     lead_type=lead_type, user_name=user_name,
-                    score=get_score(user_id), stage=stage.value,
+                    score=get_score(user_id), stage=stage.value if stage else "",
                 ))
             except Exception:
                 pass
@@ -501,8 +516,12 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
             # If user is mid-qualification and asks a question,
             # answer the question then re-prompt the current step
             if in_qual:
-                rag_answer = await ask_async(question=message, user_id=user_id)
-                rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                try:
+                    rag_answer = await ask_async(question=message, user_id=user_id)
+                    rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                except Exception as rag_err:
+                    logger.error("RAG_ERROR (factual_midflow) | %s", rag_err)
+                    rag_answer = RAG_ERROR_MESSAGE
                 current_prompt = get_current_qual_prompt(user_id)
                 # Send answer and re-prompt as separate messages for clarity
                 if phone:
@@ -513,8 +532,12 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 return {"status": "factual_midflow", "answer": reply}
 
             # Pure factual question — answer only, no qualification trigger
-            answer = await ask_async(question=message, user_id=user_id)
-            answer = format_whatsapp_response(answer, is_factual=True)
+            try:
+                answer = await ask_async(question=message, user_id=user_id)
+                answer = format_whatsapp_response(answer, is_factual=True)
+            except Exception as rag_err:
+                logger.error("RAG_ERROR (factual) | %s", rag_err)
+                answer = RAG_ERROR_MESSAGE
 
             # Check for confusion escalation
             from rag.retriever import NO_CONTEXT_MSG
@@ -569,8 +592,12 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
 
             if result is None:
                 # User asked a question mid-flow — answer via RAG + re-prompt
-                rag_answer = await ask_async(question=message, user_id=user_id)
-                rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                try:
+                    rag_answer = await ask_async(question=message, user_id=user_id)
+                    rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+                except Exception as rag_err:
+                    logger.error("RAG_ERROR (qual_midflow) | %s", rag_err)
+                    rag_answer = RAG_ERROR_MESSAGE
                 current_prompt = get_current_qual_prompt(user_id)
                 if phone:
                     await send_whatsapp_message(phone, rag_answer)
@@ -584,8 +611,8 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
             # Check if qualification just completed
             lead = complete_lead(user_id)
             if lead:
-                lead.stage = stage.value
-                lead.persona = persona.value
+                lead.stage = stage.value if stage else ""
+                lead.persona = persona.value if persona else ""
 
                 await save_lead_to_db(lead)
                 await notify_admin_qualified_lead(lead)
@@ -604,8 +631,12 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
         # =============================================================
         # PRIORITY 6: General Fallback → short RAG answer
         # =============================================================
-        answer = await ask_async(question=message, user_id=user_id)
-        answer = format_whatsapp_response(answer, is_factual=False)
+        try:
+            answer = await ask_async(question=message, user_id=user_id)
+            answer = format_whatsapp_response(answer, is_factual=False)
+        except Exception as rag_err:
+            logger.error("RAG_ERROR (general) | %s", rag_err)
+            answer = RAG_ERROR_MESSAGE
 
         # Confusion escalation
         from rag.retriever import NO_CONTEXT_MSG
