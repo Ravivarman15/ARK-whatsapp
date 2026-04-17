@@ -25,9 +25,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Supabase ──────────────────────────────────────────────────
-    SUPABASE_URL: str
-    SUPABASE_KEY: str
+    # ── Supabase (used for leads / followups — not for vector search) ─
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
 
     # ── HuggingFace ───────────────────────────────────────────────
     HF_API_TOKEN: str

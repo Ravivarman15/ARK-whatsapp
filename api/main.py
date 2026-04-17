@@ -23,18 +23,16 @@ Features:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
-from rag.embeddings import close_client as close_embedding_client
+from rag.whatsapp_sender import send_whatsapp_message
 from rag.retriever import ask_async
 from rag.escalation import (
     detect_human_request, detect_complaint, notify_admin,
@@ -96,12 +94,24 @@ logger = logging.getLogger("ark.api")
 async def lifespan(app: FastAPI):
     """Start background jobs at startup; clean up at shutdown."""
     logger.info("Starting ARK AI Bot ...")
-    logger.info("Using HuggingFace Inference API for embeddings (no local model).")
+    logger.info("Using page index (TF-IDF) for document search — no embeddings.")
+
+    # Auto-build index if missing (safety net for first Render deploy)
+    from rag.page_index import INDEX_PATH, build_index
+    from pathlib import Path
+    if not Path(INDEX_PATH).exists():
+        logger.warning("Page index not found — building now from ark_details.docx ...")
+        try:
+            doc = Path(__file__).parent.parent / "documents" / "ark_details.docx"
+            build_index(doc_path=doc)
+            logger.info("Page index built successfully.")
+        except Exception as _e:
+            logger.error("Failed to build page index: %s", _e)
+
     start_followup_scheduler()
     logger.info("Server is live.")
     yield
     stop_followup_scheduler()
-    await close_embedding_client()
     logger.info("Shutting down ARK AI Bot.")
 
 
@@ -194,69 +204,8 @@ class WhatsAppPayload(BaseModel):
     )
 
 
-# =====================================================================
-# AiSensy Reply Helper
-# =====================================================================
-
-MAX_SEND_RETRIES = 1  # Retry once on failure
 FALLBACK_MESSAGE = "Sorry, I'm having trouble right now. Please try again in a moment."
-
-# Graceful error message when RAG pipeline fails
 RAG_ERROR_MESSAGE = "I couldn't process that right now. Please try again or ask a different question."
-
-
-async def send_whatsapp_message(phone: str, message: str) -> None:
-    """
-    Send a reply message back to WhatsApp via the AiSensy Project API.
-
-    Uses the session-message endpoint (free-text within 24-hour window).
-    Includes retry logic for transient failures.
-    """
-    s = get_settings()
-    if not s.AISENSY_API_KEY:
-        logger.warning("AISENSY_API_KEY not set - skipping WhatsApp reply.")
-        return
-
-    if not s.AISENSY_PROJECT_ID:
-        logger.warning("AISENSY_PROJECT_ID not set - skipping WhatsApp reply.")
-        return
-
-    # AiSensy expects bare numbers without + prefix (e.g. 917305801869)
-    destination = phone.lstrip("+")
-
-    url = (
-        f"https://apis.aisensy.com/project-apis/v1/"
-        f"project/{s.AISENSY_PROJECT_ID}/messages"
-    )
-    headers = {
-        "X-AiSensy-Project-API-Pwd": s.AISENSY_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "to": destination,
-        "type": "text",
-        "recipient_type": "individual",
-        "text": {"body": message},
-    }
-
-    for attempt in range(1 + MAX_SEND_RETRIES):
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                if resp.status_code in (200, 201):
-                    logger.info("SEND_MESSAGE | phone=%s | status=sent", phone)
-                    return
-                else:
-                    logger.error(
-                        "SEND_MESSAGE | AiSensy API error (%d): %s",
-                        resp.status_code, resp.text,
-                    )
-        except Exception as e:
-            logger.error("SEND_MESSAGE | attempt=%d | error=%s", attempt + 1, e)
-
-        if attempt < MAX_SEND_RETRIES:
-            logger.info("SEND_MESSAGE | retrying in 2s ...")
-            await asyncio.sleep(2)
 
 
 # =====================================================================

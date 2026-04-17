@@ -4,30 +4,41 @@ rag/followup_manager.py
 Automated follow-up system for the ARK Learning Arena WhatsApp bot.
 
 Tracks user activity timestamps in Supabase and sends staged follow-up
-messages to users who stop responding during a conversation.
+messages to users who stop responding during a conversation — all within
+the 24-hour WhatsApp session window.
 
-All follow-ups are within the 24-hour WhatsApp session window:
-    0 = No follow-up sent
-    1 = First follow-up sent  (after 30 min inactivity)
-    2 = Second follow-up sent (after 5 hr inactivity)
-    3 = Third follow-up sent  (after 18 hr inactivity)
+Stages (measured from last USER message):
+    1 → 30 min inactivity
+    2 → 4 hr  inactivity
+    3 → 16 hr inactivity
 
-Follow-ups are suppressed when:
-    - The user has replied recently
-    - Lead qualification is already completed / in-progress
-    - Admin escalation or hot lead detection has occurred
+Rules:
+    - All sends happen WITHIN the 24-hr WhatsApp session window (<86400s)
+    - Users outside the 24-hr window are marked 'expired' — no send
+    - Stale stages (server restart catch-up) are skipped, not spammed:
+      only the single most-appropriate stage is sent per check cycle
+    - DB stage is updated BEFORE the message is sent to prevent duplicates
+    - Follow-ups are suppressed when user is in active lead qualification,
+      or when status is 'escalated' / 'completed' / 'expired'
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from config.settings import get_settings
 from rag.lead_manager import is_in_qualification
 
 logger = logging.getLogger("ark.followup")
+
+# Maximum seconds past a stage's ideal send time before we skip it
+# (prevents blasting 2-3 messages at once after server restart)
+_MAX_STAGE_CATCHUP = 3600  # 1 hour — if missed by >1hr, skip to next
+
+# WhatsApp 24-hour session window
+_WHATSAPP_WINDOW = 86400  # seconds
 
 
 # =====================================================================
@@ -51,206 +62,107 @@ FOLLOWUP_MESSAGES = {
     ),
 }
 
-# Drop-off recovery messages (when user stops mid-qualification)
-DROPOFF_MESSAGES = {
-    "ask_name": "Hi! You were interested in our program. What's the student's name?",
-    "ask_class": "Which class is the student in?",
-    "ask_school": "Which school does the student study in?",
-    "ask_parent_phone": "Please share a contact number so our counsellor can call.",
-}
-
 
 # =====================================================================
-# Record User Activity
+# Record User Activity  (called on every incoming message)
 # =====================================================================
 
 async def record_user_activity(phone: str) -> None:
     """
-    Record that a user just sent a message.
+    Record that a user just sent a message — resets their follow-up state.
 
-    Upserts the `ark_followups` row for this phone number:
-      - Resets `last_message_time` to now
-      - Resets `followup_stage` to 0
-      - Sets `status` to 'active'
-
-    This ensures any pending follow-ups are cancelled when the user
-    re-engages.
+    Upserts the `ark_followups` row:
+      - last_message_time → now (UTC)
+      - followup_stage    → 0  (restart the follow-up sequence)
+      - status            → 'active'
     """
     if not phone:
         return
-
     try:
         from rag.retriever import get_supabase_client
-
         client = get_supabase_client()
         now = datetime.now(timezone.utc).isoformat()
-
-        row = {
-            "phone": phone,
-            "last_message_time": now,
-            "followup_stage": 0,
-            "status": "active",
-        }
-
-        # Upsert — insert if new, update if phone already exists
         client.table("ark_followups").upsert(
-            row, on_conflict="phone"
+            {
+                "phone": phone,
+                "last_message_time": now,
+                "followup_stage": 0,
+                "status": "active",
+            },
+            on_conflict="phone",
         ).execute()
-
-        logger.debug("FOLLOWUP_ACTIVITY | phone=%s | reset", phone)
+        logger.debug("FOLLOWUP_ACTIVITY | phone=%s | reset to stage 0", phone)
     except Exception as e:
-        logger.error("Failed to record user activity: %s", e)
+        logger.error("record_user_activity failed for %s: %s", phone, e)
 
 
 # =====================================================================
-# Skip Logic
-# =====================================================================
-
-def should_skip_followup(phone: str) -> bool:
-    """
-    Determine whether follow-ups should be skipped for this user.
-
-    Returns True if:
-      - The user is in an active lead qualification flow
-      - (Escalation / hot lead state is handled by checking the
-        'status' column in the DB — rows marked 'escalated' or
-        'completed' are excluded from the query itself.)
-    """
-    user_id = phone  # user_id == phone in the webhook
-    if is_in_qualification(user_id):
-        return True
-    return False
-
-
-# =====================================================================
-# Send Follow-Up Message
-# =====================================================================
-
-async def send_followup_message(phone: str, stage: int) -> bool:
-    """
-    Send a follow-up message to the user via AiSensy and update
-    the `followup_stage` in the database.
-
-    Args:
-        phone: The user's phone number.
-        stage: The follow-up stage (1, 2, or 3).
-
-    Returns:
-        True if the message was sent successfully.
-    """
-    # Import here to avoid circular imports
-    from api.main import send_whatsapp_message
-    from rag.retriever import get_supabase_client
-
-    s = get_settings()
-
-    message = FOLLOWUP_MESSAGES.get(stage)
-    if not message:
-        logger.warning("No follow-up message template for stage %d", stage)
-        return False
-
-    try:
-        # Send the WhatsApp message
-        await send_whatsapp_message(phone, message)
-
-        # Update stage in database
-        client = get_supabase_client()
-        update_data = {"followup_stage": stage}
-
-        # If this is the final stage, mark as completed
-        if stage >= s.MAX_FOLLOWUP_STAGE:
-            update_data["status"] = "completed"
-
-        client.table("ark_followups").update(update_data).eq(
-            "phone", phone
-        ).execute()
-
-        logger.info("FOLLOWUP_SENT | phone=%s | stage=%d", phone, stage)
-        return True
-    except Exception as e:
-        logger.error("Failed to send follow-up (stage %d) to %s: %s", stage, phone, e)
-        return False
-
-
-# =====================================================================
-# Mark User as Escalated (called from webhook on hot lead / escalation)
+# Mark helpers
 # =====================================================================
 
 async def mark_followup_escalated(phone: str) -> None:
-    """
-    Mark a user's follow-up record as 'escalated' so no further
-    follow-ups are sent. Called when a hot lead or human escalation
-    is detected.
-    """
+    """Suppress all future follow-ups for this user (human escalation)."""
     if not phone:
         return
-
     try:
         from rag.retriever import get_supabase_client
-
-        client = get_supabase_client()
-        client.table("ark_followups").update(
+        get_supabase_client().table("ark_followups").update(
             {"status": "escalated"}
         ).eq("phone", phone).execute()
-
         logger.info("FOLLOWUP_ESCALATED | phone=%s", phone)
     except Exception as e:
-        logger.error("Failed to mark follow-up escalated: %s", e)
+        logger.error("mark_followup_escalated failed for %s: %s", phone, e)
 
-
-# =====================================================================
-# Mark User as Completed (called when lead qualification finishes)
-# =====================================================================
 
 async def mark_followup_completed(phone: str) -> None:
-    """
-    Mark a user's follow-up record as 'completed' so no further
-    follow-ups are sent. Called when lead qualification completes.
-    """
+    """Suppress all future follow-ups for this user (lead qualified)."""
     if not phone:
         return
-
     try:
         from rag.retriever import get_supabase_client
-
-        client = get_supabase_client()
-        client.table("ark_followups").update(
+        get_supabase_client().table("ark_followups").update(
             {"status": "completed"}
         ).eq("phone", phone).execute()
-
         logger.info("FOLLOWUP_COMPLETED | phone=%s", phone)
     except Exception as e:
-        logger.error("Failed to mark follow-up completed: %s", e)
+        logger.error("mark_followup_completed failed for %s: %s", phone, e)
 
 
 # =====================================================================
-# Check Follow-Ups (called periodically by the scheduler)
+# Core: Check and Send Follow-Ups
 # =====================================================================
 
 async def check_followups() -> int:
     """
-    Query the database for users who are due for a follow-up message.
+    Query Supabase for users due for a follow-up and send messages.
 
-    Logic:
-      - Only check rows with status='active'
-      - Stage 0 → if inactivity > STAGE1_DELAY  → send stage 1
-      - Stage 1 → if inactivity > STAGE2_DELAY  → send stage 2
-      - Stage 2 → if inactivity > STAGE3_DELAY  → send stage 3
-      - Stage 3 → already maxed out (skipped by query)
+    Called every FOLLOWUP_CHECK_INTERVAL seconds by the scheduler.
 
-    Returns:
-        The number of follow-up messages sent.
+    For each active user:
+      1. Skip if outside the 24-hr WhatsApp window (mark 'expired')
+      2. Skip if user is in active lead qualification
+      3. Find the highest stage that is overdue (avoids catch-up spam)
+      4. Update DB stage FIRST, then send message
+
+    Returns the number of messages sent.
     """
     from rag.retriever import get_supabase_client
+    from rag.whatsapp_sender import send_whatsapp_message
 
     s = get_settings()
     sent_count = 0
+
+    # Stage → seconds from last_message_time
+    stage_delays = {
+        1: s.FOLLOWUP_STAGE1_DELAY,
+        2: s.FOLLOWUP_STAGE2_DELAY,
+        3: s.FOLLOWUP_STAGE3_DELAY,
+    }
 
     try:
         client = get_supabase_client()
         now = datetime.now(timezone.utc)
 
-        # Fetch all active follow-up records that haven't maxed out
         result = (
             client.table("ark_followups")
             .select("phone, last_message_time, followup_stage")
@@ -258,50 +170,131 @@ async def check_followups() -> int:
             .lt("followup_stage", s.MAX_FOLLOWUP_STAGE)
             .execute()
         )
-
         rows = result.data or []
+
         if not rows:
+            logger.debug("FOLLOWUP_CHECK | no active users to check")
             return 0
 
-        # Build delay mapping
-        stage_delays = {
-            1: s.FOLLOWUP_STAGE1_DELAY,
-            2: s.FOLLOWUP_STAGE2_DELAY,
-            3: s.FOLLOWUP_STAGE3_DELAY,
-        }
+        logger.debug("FOLLOWUP_CHECK | checking %d active user(s)", len(rows))
 
         for row in rows:
-            phone = row["phone"]
-            stage = row["followup_stage"]
-            last_msg_str = row["last_message_time"]
+            phone: str = row["phone"]
+            current_stage: int = row["followup_stage"]
+            last_msg_str: str = row.get("last_message_time", "")
 
-            # Parse the last message timestamp
+            # ── Parse timestamp ──────────────────────────────────
             try:
                 last_msg_time = datetime.fromisoformat(
                     last_msg_str.replace("Z", "+00:00")
                 )
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid last_message_time for %s: %s", phone, last_msg_str
+                # Ensure timezone-aware (Supabase sometimes omits tz)
+                if last_msg_time.tzinfo is None:
+                    last_msg_time = last_msg_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError, AttributeError):
+                logger.warning("FOLLOWUP_CHECK | bad timestamp for %s: %s", phone, last_msg_str)
+                continue
+
+            elapsed: float = (now - last_msg_time).total_seconds()
+
+            # ── 24-hour window check ─────────────────────────────
+            if elapsed >= _WHATSAPP_WINDOW:
+                logger.info(
+                    "FOLLOWUP_EXPIRED | phone=%s | elapsed=%.1fhr — marking expired",
+                    phone, elapsed / 3600,
+                )
+                try:
+                    client.table("ark_followups").update(
+                        {"status": "expired"}
+                    ).eq("phone", phone).execute()
+                except Exception as e:
+                    logger.error("Failed to mark expired for %s: %s", phone, e)
+                continue
+
+            # ── Skip if user is in active qualification ──────────
+            if is_in_qualification(phone):
+                logger.debug("FOLLOWUP_SKIP | phone=%s | in qualification", phone)
+                continue
+
+            # ── Determine which stage to send ────────────────────
+            # Find the HIGHEST due stage (avoids sending stale stages
+            # from before a server restart gap)
+            target_stage: Optional[int] = None
+
+            for stage in range(current_stage + 1, s.MAX_FOLLOWUP_STAGE + 1):
+                delay = stage_delays.get(stage, 0)
+                if elapsed < delay:
+                    break  # Not yet due — higher stages also not due
+                # Due. Check if it's so overdue we should skip it.
+                next_delay = stage_delays.get(stage + 1)
+                if next_delay and elapsed >= next_delay:
+                    # This stage's send window has passed (next stage is
+                    # already due too) — skip this stage to avoid spam
+                    logger.debug(
+                        "FOLLOWUP_SKIP_STALE | phone=%s | stage=%d | elapsed=%.1fhr",
+                        phone, stage, elapsed / 3600,
+                    )
+                    continue
+                target_stage = stage
+
+            if target_stage is None:
+                logger.debug(
+                    "FOLLOWUP_CHECK | phone=%s | no stage due (elapsed=%.1fhr, stage=%d)",
+                    phone, elapsed / 3600, current_stage,
                 )
                 continue
 
-            elapsed_seconds = (now - last_msg_time).total_seconds()
+            # ── Update DB FIRST (prevents double-send on overlap) ─
+            try:
+                update_data: dict = {"followup_stage": target_stage}
+                if target_stage >= s.MAX_FOLLOWUP_STAGE:
+                    update_data["status"] = "completed"
 
-            # Determine if a follow-up is due
-            next_stage = stage + 1
-            delay = stage_delays.get(next_stage)
+                client.table("ark_followups").update(update_data).eq(
+                    "phone", phone
+                ).execute()
+            except Exception as e:
+                logger.error(
+                    "FOLLOWUP_DB_UPDATE_FAILED | phone=%s | stage=%d | %s",
+                    phone, target_stage, e,
+                )
+                continue  # Skip send if DB update failed
 
-            if delay and elapsed_seconds >= delay:
-                if not should_skip_followup(phone):
-                    await send_followup_message(phone, next_stage)
-                    sent_count += 1
+            # ── Send message ─────────────────────────────────────
+            message = FOLLOWUP_MESSAGES.get(target_stage)
+            if not message:
+                logger.warning("No template for stage %d", target_stage)
+                continue
 
-        if sent_count:
-            logger.info("FOLLOWUP_CHECK | sent=%d follow-ups", sent_count)
+            ok = await send_whatsapp_message(phone, message)
+
+            if ok:
+                logger.info(
+                    "FOLLOWUP_SENT | phone=%s | stage=%d | elapsed=%.1fhr",
+                    phone, target_stage, elapsed / 3600,
+                )
+                sent_count += 1
+            else:
+                # Revert DB stage so we retry next cycle
+                logger.error(
+                    "FOLLOWUP_SEND_FAILED | phone=%s | stage=%d — reverting DB",
+                    phone, target_stage,
+                )
+                try:
+                    revert: dict = {"followup_stage": current_stage}
+                    if update_data.get("status") == "completed":
+                        revert["status"] = "active"
+                    client.table("ark_followups").update(revert).eq(
+                        "phone", phone
+                    ).execute()
+                except Exception as e:
+                    logger.error("FOLLOWUP_REVERT_FAILED | phone=%s | %s", phone, e)
 
     except Exception as e:
-        logger.error("Follow-up check failed: %s", e)
+        logger.error("check_followups failed: %s", e)
+
+    if sent_count:
+        logger.info("FOLLOWUP_CHECK | sent=%d message(s) this cycle", sent_count)
 
     return sent_count
 
@@ -314,12 +307,7 @@ _scheduler = None
 
 
 def start_followup_scheduler() -> None:
-    """
-    Start the APScheduler background job that periodically calls
-    `check_followups()`.
-
-    Safe to call multiple times — only starts once.
-    """
+    """Start the APScheduler background job. Safe to call multiple times."""
     global _scheduler
 
     if _scheduler is not None:
@@ -329,22 +317,19 @@ def start_followup_scheduler() -> None:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     s = get_settings()
-    interval = s.FOLLOWUP_CHECK_INTERVAL
-
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
         check_followups,
         trigger="interval",
-        seconds=interval,
+        seconds=s.FOLLOWUP_CHECK_INTERVAL,
         id="followup_checker",
         name="Follow-up Checker",
         replace_existing=True,
+        max_instances=1,        # never run two overlapping instances
+        misfire_grace_time=30,  # if missed by <30s, still run; else skip
     )
     _scheduler.start()
-
-    logger.info(
-        "Follow-up scheduler started (interval=%ds)", interval
-    )
+    logger.info("Follow-up scheduler started (interval=%ds)", s.FOLLOWUP_CHECK_INTERVAL)
 
 
 def stop_followup_scheduler() -> None:

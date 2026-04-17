@@ -4,19 +4,18 @@ rag/retriever.py
 Production RAG pipeline with:
 
   - Configurable LLM (env var LLM_MODEL)
-  - Supabase pgvector similarity search (top_k = 3)
+  - Vector-less page index search (TF-IDF + keyword scoring)
   - Question cache (in-memory / Redis)
   - Per-user conversation memory (last N turns)
   - Enhanced AI personality (Academic Advisor)
   - Stage-aware prompting
   - Persona-aware prompting
   - Psychological trigger injection
-  - ADA conversion injection
   - Tamil language detection + switching
   - Structured performance logging per request
-  - HuggingFace InferenceClient (handles new router.huggingface.co)
+  - HuggingFace InferenceClient
 
-Latency target: 2-3 seconds end-to-end.
+Latency target: <2 seconds end-to-end (no embedding network call).
 """
 
 from __future__ import annotations
@@ -32,19 +31,19 @@ from huggingface_hub import InferenceClient
 from supabase import create_client, Client
 
 from config.settings import get_settings
-from rag.embeddings import embed_query
+from rag.page_index import search_index
 from rag.cache import get_cache
 
 logger = logging.getLogger("ark.retriever")
 
 
 # =====================================================================
-# Supabase Client (singleton)
+# Supabase Client (singleton — used by lead_manager / followup_manager)
 # =====================================================================
 
 @lru_cache(maxsize=1)
 def get_supabase_client() -> Client:
-    """Initialise and cache the Supabase client."""
+    """Initialise and cache the Supabase client (for leads/followups)."""
     s = get_settings()
     return create_client(s.SUPABASE_URL, s.SUPABASE_KEY)
 
@@ -61,9 +60,7 @@ def get_hf_client() -> InferenceClient:
     global _hf_client
     if _hf_client is None:
         s = get_settings()
-        _hf_client = InferenceClient(
-            api_key=s.HF_API_TOKEN,
-        )
+        _hf_client = InferenceClient(api_key=s.HF_API_TOKEN)
         logger.info("HuggingFace InferenceClient initialised")
     return _hf_client
 
@@ -74,11 +71,7 @@ def get_hf_client() -> InferenceClient:
 
 @dataclass
 class ConversationMemory:
-    """
-    Per-user sliding-window conversation memory.
-    Stores the last N question/answer turns so the LLM can resolve
-    follow-up questions.
-    """
+    """Per-user sliding-window conversation memory (last N turns)."""
     max_turns: int = 3
     _store: dict = field(default_factory=lambda: defaultdict(list))
 
@@ -105,21 +98,6 @@ def get_memory() -> ConversationMemory:
 
 
 # =====================================================================
-# Vector Similarity Search
-# =====================================================================
-
-def search_similar(query_embedding: list[float], top_k: int = 3) -> list[str]:
-    """Cosine-similarity search via the Supabase match_ark_docs RPC."""
-    client = get_supabase_client()
-    response = client.rpc(
-        "match_ark_docs",
-        {"query_embedding": query_embedding, "match_count": top_k},
-    ).execute()
-    results = response.data or []
-    return [row["content"] for row in results]
-
-
-# =====================================================================
 # System Instruction (Enhanced Bot Personality)
 # =====================================================================
 
@@ -129,7 +107,7 @@ SYSTEM_INSTRUCTION = (
     "based in Chennai, established in 2015 with 500+ students trained.\n\n"
     "RESPONSE FORMAT (STRICT):\n"
     "- You are responding on WhatsApp\n"
-    "- Keep ALL responses to 2-3 lines MAX\n"
+    "- Keep ALL responses to 2-4 lines MAX\n"
     "- Use bullet points for lists\n"
     "- NO paragraphs, NO long explanations\n"
     "- Simple English, conversational tone\n"
@@ -148,10 +126,10 @@ SYSTEM_INSTRUCTION = (
     "- Do NOT add 'book assessment' or promotional lines unless asked\n"
 )
 
-# =====================================================================
-# Enhanced Message Builder
-# =====================================================================
 
+# =====================================================================
+# Message Builder
+# =====================================================================
 
 def _build_messages(
     question: str,
@@ -162,15 +140,6 @@ def _build_messages(
     trigger_line: str = "",
     is_tamil: bool = False,
 ) -> list[dict]:
-    """
-    Build chat messages for the HuggingFace chat_completion API.
-
-    Returns a list of {role, content} dicts:
-      - system: grounding instruction + stage/persona modifiers
-      - user/assistant: past conversation turns (if any)
-      - user: current context + question
-    """
-    # Build enhanced system message
     sys_parts = [SYSTEM_INSTRUCTION]
 
     if stage_instruction:
@@ -191,37 +160,31 @@ def _build_messages(
             f"\nINCLUDE THIS LINE naturally in your response:\n\"{trigger_line}\""
         )
 
-    system_content = "\n".join(sys_parts)
-    messages = [{"role": "system", "content": system_content}]
+    messages = [{"role": "system", "content": "\n".join(sys_parts)}]
 
-    # Add conversation history as alternating user/assistant turns
     if history:
         for turn in history:
             messages.append({"role": "user", "content": turn["q"]})
             messages.append({"role": "assistant", "content": turn["a"]})
 
-    # Current question with context
     context_block = "\n\n".join(context_chunks)
-    user_content = f"CONTEXT:\n{context_block}\n\nQUESTION: {question}"
-    messages.append({"role": "user", "content": user_content})
-
+    messages.append({"role": "user", "content": f"CONTEXT:\n{context_block}\n\nQUESTION: {question}"})
     return messages
 
 
 # =====================================================================
-# LLM Answer Generation (via huggingface_hub InferenceClient)
+# LLM Answer Generation
 # =====================================================================
 
-def generate_answer(question: str, context_chunks: list[str],
-                    history: Optional[list[dict]] = None,
-                    stage_instruction: str = "",
-                    persona_instruction: str = "",
-                    trigger_line: str = "",
-                    is_tamil: bool = False) -> str:
-    """
-    Send context + question to the configured LLM via HuggingFace
-    InferenceClient chat_completion API (synchronous).
-    """
+def generate_answer(
+    question: str,
+    context_chunks: list[str],
+    history: Optional[list[dict]] = None,
+    stage_instruction: str = "",
+    persona_instruction: str = "",
+    trigger_line: str = "",
+    is_tamil: bool = False,
+) -> str:
     s = get_settings()
     client = get_hf_client()
     messages = _build_messages(
@@ -240,30 +203,25 @@ def generate_answer(question: str, context_chunks: list[str],
             temperature=0.3,
             top_p=0.9,
         )
-
-        if response.choices and len(response.choices) > 0:
+        if response.choices:
             content = response.choices[0].message.content
             if content:
                 return content.strip()
-
         return "Sorry, I was unable to generate a response. Please try again."
-
     except Exception as e:
         logger.error("LLM generation failed: %s", e)
         raise RuntimeError(f"HuggingFace API error: {e}")
 
 
-async def generate_answer_async(question: str, context_chunks: list[str],
-                                 history: Optional[list[dict]] = None,
-                                 stage_instruction: str = "",
-                                 persona_instruction: str = "",
-                                 trigger_line: str = "",
-                                 is_tamil: bool = False) -> str:
-    """
-    Async wrapper — calls the sync InferenceClient.
-    HuggingFace InferenceClient handles HTTP internally.
-    For true async, use AsyncInferenceClient (requires additional setup).
-    """
+async def generate_answer_async(
+    question: str,
+    context_chunks: list[str],
+    history: Optional[list[dict]] = None,
+    stage_instruction: str = "",
+    persona_instruction: str = "",
+    trigger_line: str = "",
+    is_tamil: bool = False,
+) -> str:
     return generate_answer(
         question, context_chunks, history,
         stage_instruction=stage_instruction,
@@ -278,7 +236,7 @@ async def generate_answer_async(question: str, context_chunks: list[str],
 # =====================================================================
 
 NO_CONTEXT_MSG = (
-    "I\'m sorry, I couldn\'t find relevant information in our knowledge base. "
+    "I'm sorry, I couldn't find relevant information in our knowledge base. "
     "Please contact ARK Learning Arena directly for assistance."
 )
 
@@ -289,25 +247,19 @@ async def ask_async(
     top_k: int = 3,
 ) -> str:
     """
-    Full async RAG pipeline with caching, memory, intelligence layering,
-    and performance logging.
+    Full async RAG pipeline using page index search (no embeddings/vector DB).
 
     Steps:
-      1. Check cache -> return if hit
+      1. Check cache
       2. Detect intelligence signals (stage, persona, language, triggers)
-      3. Embed question
-      4. Vector search in Supabase
-      5. Generate LLM answer with enhanced context
-      6. Inject ADA recommendation (if appropriate)
-      7. Store in cache and memory
-      8. Log all timings
+      3. Search page index (TF-IDF keyword search)
+      4. Generate LLM answer
+      5. Cache + memory
     """
     from rag.stage_detector import detect_and_update_stage, get_stage_instruction
     from rag.persona_detector import detect_and_update_persona, get_persona_instruction
     from rag.psychology_engine import (
-        should_inject_trigger, get_next_trigger,
-        should_inject_ada, get_ada_line,
-        detect_tamil,
+        should_inject_trigger, get_next_trigger, detect_tamil,
     )
     from rag.scoring import score_from_message
 
@@ -319,11 +271,7 @@ async def ask_async(
     # Step 1: Cache check
     cached = cache.get(question)
     if cached:
-        total_time = (time.perf_counter() - total_start) * 1000
-        logger.info(
-            "PERF | cache_hit=True | total_ms=%.1f",
-            total_time,
-        )
+        logger.info("PERF | cache_hit=True | total_ms=%.1f", (time.perf_counter() - total_start) * 1000)
         return cached
 
     # Step 2: Intelligence signal detection
@@ -334,29 +282,21 @@ async def ask_async(
     persona_inst = get_persona_instruction(persona)
 
     is_tamil = detect_tamil(question)
-
-    # Score from message content
     score_from_message(user_id, question)
 
-    # Trigger rotation
     trigger_line = ""
     if should_inject_trigger(user_id, frequency=s.TRIGGER_ROTATION_FREQUENCY):
         trigger_line = get_next_trigger(user_id)
 
-    # Step 3: Embed question
+    # Step 3: Page index search (fast, in-memory)
     t0 = time.perf_counter()
-    query_embedding = embed_query(question)
-    embedding_time = (time.perf_counter() - t0) * 1000
-
-    # Step 4: Vector search
-    t0 = time.perf_counter()
-    context_chunks = search_similar(query_embedding, top_k=top_k)
+    context_chunks = search_index(question, k=top_k)
     search_time = (time.perf_counter() - t0) * 1000
 
     if not context_chunks:
         return NO_CONTEXT_MSG
 
-    # Step 5: Generate answer with intelligence context
+    # Step 4: Generate answer
     history = memory.get_history(user_id)
     t0 = time.perf_counter()
     answer = await generate_answer_async(
@@ -368,38 +308,28 @@ async def ask_async(
     )
     llm_time = (time.perf_counter() - t0) * 1000
 
-    # Step 6: ADA injection — DISABLED (now controlled by intent router)
-    # Auto-injection removed to prevent random "book assessment" prompts.
-    # ADA is only shown after explicit admission intent.
-
     total_time = (time.perf_counter() - total_start) * 1000
 
-    # Step 7: Cache and memory
+    # Step 5: Cache and memory
     cache.set(question, answer)
     memory.add_turn(user_id, question, answer)
 
-    # Step 8: Log performance
     logger.info(
         "PERF | user=%s | stage=%s | persona=%s | tamil=%s | "
-        "embedding_ms=%.1f | search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
+        "search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
         user_id, stage.value, persona.value, is_tamil,
-        embedding_time, search_time, llm_time, total_time,
+        search_time, llm_time, total_time,
     )
 
     return answer
 
 
 def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
-    """
-    Synchronous RAG pipeline (for scripts and testing).
-    Same logic as ask_async but uses sync calls.
-    """
+    """Synchronous RAG pipeline (for scripts and testing)."""
     from rag.stage_detector import detect_and_update_stage, get_stage_instruction
     from rag.persona_detector import detect_and_update_persona, get_persona_instruction
     from rag.psychology_engine import (
-        should_inject_trigger, get_next_trigger,
-        should_inject_ada, get_ada_line,
-        detect_tamil,
+        should_inject_trigger, get_next_trigger, detect_tamil,
     )
     from rag.scoring import score_from_message
 
@@ -410,11 +340,9 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
 
     cached = cache.get(question)
     if cached:
-        total_time = (time.perf_counter() - total_start) * 1000
-        logger.info("PERF | cache_hit=True | total_ms=%.1f", total_time)
+        logger.info("PERF | cache_hit=True | total_ms=%.1f", (time.perf_counter() - total_start) * 1000)
         return cached
 
-    # Intelligence signals
     stage = detect_and_update_stage(user_id, question)
     stage_inst = get_stage_instruction(stage)
 
@@ -429,11 +357,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
         trigger_line = get_next_trigger(user_id)
 
     t0 = time.perf_counter()
-    query_embedding = embed_query(question)
-    embedding_time = (time.perf_counter() - t0) * 1000
-
-    t0 = time.perf_counter()
-    context_chunks = search_similar(query_embedding, top_k=top_k)
+    context_chunks = search_index(question, k=top_k)
     search_time = (time.perf_counter() - t0) * 1000
 
     if not context_chunks:
@@ -450,18 +374,15 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
     )
     llm_time = (time.perf_counter() - t0) * 1000
 
-    # ADA injection — DISABLED (now controlled by intent router)
-
     total_time = (time.perf_counter() - total_start) * 1000
-
     cache.set(question, answer)
     memory.add_turn(user_id, question, answer)
 
     logger.info(
         "PERF | user=%s | stage=%s | persona=%s | tamil=%s | "
-        "embedding_ms=%.1f | search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
+        "search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
         user_id, stage.value, persona.value, is_tamil,
-        embedding_time, search_time, llm_time, total_time,
+        search_time, llm_time, total_time,
     )
 
     return answer

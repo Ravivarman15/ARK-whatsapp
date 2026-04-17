@@ -152,6 +152,8 @@ def should_inject_trigger(user_id: str, frequency: int = 2) -> bool:
     state = _get_state(user_id)
     state.response_count += 1
     state.updated_at = time.time()
+    if frequency <= 0:
+        return False
     return state.response_count % frequency == 0
 
 
@@ -193,7 +195,7 @@ def should_inject_ada(user_id: str, frequency: int = 3) -> bool:
         frequency: Inject every N responses (default: 3).
     """
     state = _get_state(user_id)
-    if state.ada_count >= 3:
+    if state.ada_count >= 3 or frequency <= 0:
         return False
     return state.response_count % frequency == 0 and state.response_count > 0
 
