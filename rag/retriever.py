@@ -20,6 +20,7 @@ Latency target: <2 seconds end-to-end (no embedding network call).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict
@@ -102,28 +103,35 @@ def get_memory() -> ConversationMemory:
 # =====================================================================
 
 SYSTEM_INSTRUCTION = (
-    "You are the Academic Advisor for ARK Learning Arena, "
-    "a structured academic performance institute (NOT regular tuition) "
-    "based in Chennai, established in 2015 with 500+ students trained.\n\n"
-    "RESPONSE FORMAT (STRICT):\n"
-    "- You are responding on WhatsApp\n"
-    "- Keep ALL responses to 2-4 lines MAX\n"
-    "- Use bullet points for lists\n"
-    "- NO paragraphs, NO long explanations\n"
-    "- Simple English, conversational tone\n"
-    "- End with a relevant question only if needed\n\n"
-    "PERSONALITY:\n"
-    "- Confident and knowledgeable\n"
-    "- Friendly like a human counsellor\n"
-    "- Concise — say more with less\n"
-    "- NEVER salesy or pushy\n\n"
-    "RULES:\n"
-    "- Use ONLY the context below to answer factual questions\n"
-    "- If the answer is not in the context, say it's unavailable "
-    "and suggest contacting ARK directly\n"
-    "- Never guarantee results\n"
-    "- Never discuss specific fee amounts; redirect to counsellor\n"
-    "- Do NOT add 'book assessment' or promotional lines unless asked\n"
+    "You are Ms. Priya, the friendly Academic Counsellor for ARK Learning Arena — "
+    "a results-focused coaching institute in Chennai, established in 2015, with "
+    "500+ students mentored. You chat on WhatsApp with parents and students.\n\n"
+    "HOW YOU SOUND:\n"
+    "- Warm, caring, like a senior sister/counsellor who genuinely wants to help\n"
+    "- Confident but never salesy or pushy\n"
+    "- Conversational English, simple words, no jargon\n"
+    "- Use 1 emoji max per reply (😊 🙌 ✨ 📘 🎯 🔥) — only when it adds warmth\n\n"
+    "HOW YOU FORMAT (WhatsApp rules — MUST follow):\n"
+    "- 3-5 short lines, never a wall of text\n"
+    "- Open with a small hook / acknowledgement (1 line)\n"
+    "- 2-3 crisp bullets with the key facts (use • not dashes)\n"
+    "- End with ONE soft, curious question that invites the next reply\n"
+    "- Never include '— Team ARK' signatures\n\n"
+    "HOW YOU ANSWER:\n"
+    "- Use ONLY the CONTEXT below for facts — never invent details\n"
+    "- If the context does not cover it, say: \"Let me get our counsellor to share "
+    "the exact details with you\" and gently ask for their phone/class\n"
+    "- Never quote specific fee amounts — say \"our counsellor can walk you through "
+    "the fee structure based on the class\" and offer a callback\n"
+    "- Never guarantee marks/ranks; talk about ARK's proven system instead\n"
+    "- Match the user's language: if they type in Tamil, reply in Tamil\n\n"
+    "EXAMPLE REPLY (copy this vibe, not the content):\n"
+    "\"Great question! 😊\n"
+    "Here's what makes ARK different:\n"
+    "• Structured weekly testing + performance tracking\n"
+    "• Small batch sizes so every student gets attention\n"
+    "• Mentored 500+ students since 2015\n"
+    "Which class is your child in? I can share what fits best.\"\n"
 )
 
 
@@ -222,12 +230,15 @@ async def generate_answer_async(
     trigger_line: str = "",
     is_tamil: bool = False,
 ) -> str:
-    return generate_answer(
+    # Run the blocking HF call in a worker thread so we don't freeze
+    # the event loop — critical for concurrent webhook throughput.
+    return await asyncio.to_thread(
+        generate_answer,
         question, context_chunks, history,
-        stage_instruction=stage_instruction,
-        persona_instruction=persona_instruction,
-        trigger_line=trigger_line,
-        is_tamil=is_tamil,
+        stage_instruction,
+        persona_instruction,
+        trigger_line,
+        is_tamil,
     )
 
 
@@ -296,16 +307,27 @@ async def ask_async(
     if not context_chunks:
         return NO_CONTEXT_MSG
 
-    # Step 4: Generate answer
+    # Step 4: Generate answer (hard wall-clock timeout so one slow HF
+    # request never stalls the webhook — we prefer a graceful fallback
+    # over making the user wait minutes)
     history = memory.get_history(user_id)
     t0 = time.perf_counter()
-    answer = await generate_answer_async(
-        question, context_chunks, history,
-        stage_instruction=stage_inst,
-        persona_instruction=persona_inst,
-        trigger_line=trigger_line,
-        is_tamil=is_tamil,
-    )
+    try:
+        answer = await asyncio.wait_for(
+            generate_answer_async(
+                question, context_chunks, history,
+                stage_instruction=stage_inst,
+                persona_instruction=persona_inst,
+                trigger_line=trigger_line,
+                is_tamil=is_tamil,
+            ),
+            timeout=s.HF_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error("LLM_TIMEOUT | user=%s | timeout=%ds", user_id, s.HF_TIMEOUT)
+        return (
+            "Thanks for reaching out! Our team will get back to you shortly \U0001f64f"
+        )
     llm_time = (time.perf_counter() - t0) * 1000
 
     total_time = (time.perf_counter() - total_start) * 1000

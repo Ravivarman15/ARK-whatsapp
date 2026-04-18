@@ -34,9 +34,11 @@ class Settings(BaseSettings):
 
     # ── LLM Selection ─────────────────────────────────────────────
     # Switch models via env var without code changes.
-    # Primary:     Qwen/Qwen2.5-72B-Instruct  (free tier, fast)
-    # Alternative: meta-llama/Llama-3.3-70B-Instruct
-    LLM_MODEL: str = "Qwen/Qwen2.5-72B-Instruct"
+    # Default is a fast 8B model so WhatsApp replies land in <2s on the
+    # HuggingFace serverless inference endpoint. Heavier models (72B)
+    # regularly queue for minutes on the free tier, which was causing
+    # 5-7 hour delivery delays.
+    LLM_MODEL: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     # ── AiSensy (WhatsApp) ───────────────────────────────────────
     AISENSY_API_KEY: str = ""                  # AiSensy Project API key
@@ -65,8 +67,9 @@ class Settings(BaseSettings):
     MEMORY_MAX_TURNS: int = 3    # Number of past turns to keep per user
 
     # ── Performance ───────────────────────────────────────────────
-    HF_TIMEOUT: int = 30         # Seconds before HuggingFace call times out
-    MAX_NEW_TOKENS: int = 150    # WhatsApp-friendly short responses
+    # Tight budget: we need WhatsApp replies in <2s end-to-end.
+    HF_TIMEOUT: int = 8          # Seconds before HuggingFace call is aborted
+    MAX_NEW_TOKENS: int = 120    # WhatsApp-friendly short responses (≤4 lines)
 
     # ── Follow-Up Automation (within 24-hour WhatsApp window) ─────
     FOLLOWUP_STAGE1_DELAY: int = 1800        # Seconds before 1st follow-up (30 min)

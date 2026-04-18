@@ -89,7 +89,7 @@ def format_whatsapp_response(
     text: str,
     *,
     is_factual: bool = False,
-    max_lines: int = 6,
+    max_lines: int = 8,
 ) -> str:
     """
     Format any bot response for WhatsApp delivery.

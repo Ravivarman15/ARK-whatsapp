@@ -107,6 +107,7 @@ def build_quick_payload(
 
 MAX_RETRIES = 1
 RETRY_DELAY = 2  # seconds
+_HTTP_TIMEOUT = 8  # Zapier Catch Hooks normally respond in <1s
 
 
 async def send_lead_to_zapier(data: dict) -> bool:
@@ -127,35 +128,66 @@ async def send_lead_to_zapier(data: dict) -> bool:
     url = s.ZAPIER_WEBHOOK_URL
 
     if not url:
-        logger.debug("ZAPIER_SKIP | ZAPIER_WEBHOOK_URL not configured")
+        # Loud warning — misconfigured webhook is the #1 cause of
+        # leads silently vanishing.
+        logger.warning("ZAPIER_SKIP | ZAPIER_WEBHOOK_URL is empty — lead NOT sent to Google Sheet")
         return False
+
+    phone = data.get("phone", "?")
+    lead_type = data.get("lead_type", "?")
 
     for attempt in range(1 + MAX_RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
                 resp = await client.post(url, json=data)
-                if resp.status_code in (200, 201):
+                # Zapier Catch Hook sometimes returns 200 with a body
+                # like {"status":"success","attempt":"..."} — accept any 2xx
+                if 200 <= resp.status_code < 300:
                     logger.info(
-                        "ZAPIER_SENT | phone=%s | type=%s | status=%d",
-                        data.get("phone", "?"), data.get("lead_type", "?"),
-                        resp.status_code,
+                        "ZAPIER_SENT | phone=%s | type=%s | status=%d | body=%s",
+                        phone, lead_type, resp.status_code, resp.text[:120],
                     )
                     return True
-                else:
-                    logger.warning(
-                        "ZAPIER_ERROR | attempt=%d | status=%d | body=%s",
-                        attempt + 1, resp.status_code, resp.text[:200],
-                    )
+                logger.warning(
+                    "ZAPIER_HTTP_ERROR | attempt=%d | phone=%s | status=%d | body=%s",
+                    attempt + 1, phone, resp.status_code, resp.text[:200],
+                )
+        except httpx.TimeoutException:
+            logger.warning(
+                "ZAPIER_TIMEOUT | attempt=%d | phone=%s | timeout=%ds",
+                attempt + 1, phone, _HTTP_TIMEOUT,
+            )
         except Exception as e:
             logger.warning(
-                "ZAPIER_ERROR | attempt=%d | error=%s", attempt + 1, e,
+                "ZAPIER_EXCEPTION | attempt=%d | phone=%s | %s: %s",
+                attempt + 1, phone, type(e).__name__, e,
             )
 
         if attempt < MAX_RETRIES:
             await asyncio.sleep(RETRY_DELAY)
 
-    logger.error("ZAPIER_FAILED | phone=%s | exhausted retries", data.get("phone", "?"))
+    logger.error(
+        "ZAPIER_FAILED | phone=%s | type=%s | all %d attempt(s) exhausted",
+        phone, lead_type, 1 + MAX_RETRIES,
+    )
     return False
+
+
+def fire_and_forget(data: dict) -> None:
+    """
+    Schedule a Zapier send without blocking the caller.
+
+    Intended for use inside async request handlers where we want the
+    user-visible reply to land first. Any exception inside
+    send_lead_to_zapier is already swallowed, so we just wrap in
+    create_task and let the event loop drain it.
+    """
+    try:
+        asyncio.create_task(send_lead_to_zapier(data))
+    except RuntimeError:
+        # No running loop (e.g. called from sync context). Fall back
+        # silently — scripts should use send_lead_to_zapier_sync.
+        logger.debug("ZAPIER_FAF_NO_LOOP | no running event loop")
 
 
 # =====================================================================

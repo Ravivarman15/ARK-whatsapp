@@ -23,11 +23,12 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,7 @@ from rag.escalation import (
 from rag.lead_manager import (
     classify_lead,
     detect_course_interest,
+    detect_hot_lead,
     is_in_qualification,
     start_lead_qualification,
     store_lead_data,
@@ -66,6 +68,7 @@ from rag.followup_manager import (
 )
 from rag.zapier_integration import (
     send_lead_to_zapier, build_lead_payload, build_quick_payload,
+    fire_and_forget as zapier_fire_and_forget,
 )
 from rag.scoring import score_from_message, get_score, get_lead_type, update_score, ScoreAction
 from rag.stage_detector import detect_and_update_stage, get_stage
@@ -107,6 +110,15 @@ async def lifespan(app: FastAPI):
             logger.info("Page index built successfully.")
         except Exception as _e:
             logger.error("Failed to build page index: %s", _e)
+
+    # Zapier health check — surface misconfig at boot, not the first lead
+    _s = get_settings()
+    if _s.ZAPIER_WEBHOOK_URL:
+        logger.info("Zapier webhook configured: %s...", _s.ZAPIER_WEBHOOK_URL[:60])
+    else:
+        logger.warning(
+            "ZAPIER_WEBHOOK_URL is empty — leads will NOT be written to Google Sheet"
+        )
 
     start_followup_scheduler()
     logger.info("Server is live.")
@@ -300,6 +312,35 @@ async def health():
     return {"status": "ok", "version": "4.0.0"}
 
 
+@app.post("/zapier/test")
+async def zapier_test():
+    """
+    Diagnostic endpoint — sends a synthetic lead to the configured
+    Zapier webhook so you can verify the integration end-to-end
+    without having to simulate a full WhatsApp conversation.
+
+    Returns the raw True/False result so a misconfigured URL, 4xx,
+    or timeout is immediately visible.
+    """
+    s = get_settings()
+    sample = build_quick_payload(
+        phone="919000000000",
+        message="[diagnostic test from /zapier/test]",
+        lead_type="Diagnostic",
+        priority="LOW",
+        user_name="Zapier Test",
+        score=0,
+        stage="TEST",
+    )
+    ok = await send_lead_to_zapier(sample)
+    return {
+        "sent": ok,
+        "webhook_configured": bool(s.ZAPIER_WEBHOOK_URL),
+        "webhook_prefix": s.ZAPIER_WEBHOOK_URL[:60] if s.ZAPIER_WEBHOOK_URL else None,
+        "payload": sample,
+    }
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(body: AskRequest):
     """Accept a user question, run the RAG pipeline, and return an answer."""
@@ -320,26 +361,46 @@ async def ask_endpoint(body: AskRequest):
 
 
 @app.post("/whatsapp")
-async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = None):
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     AiSensy WhatsApp webhook — smart admission assistant.
+
+    IMPORTANT: AiSensy retries webhook calls that take longer than a few
+    seconds, which was producing duplicate messages and cascading delays.
+    So we read the payload, fire the full processing pipeline as a
+    background task, and ACK AiSensy immediately. The user's reply is
+    then sent via the outbound AiSensy Project API from the background
+    task — usually within 1-2 seconds.
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error("WEBHOOK_BAD_PAYLOAD | %s", e)
+        return {"status": "bad_payload"}
+
+    background_tasks.add_task(_process_incoming_message, payload)
+    return {"status": "accepted"}
+
+
+async def _process_incoming_message(payload: dict) -> None:
+    """
+    Actual pipeline — runs after the webhook has already returned.
 
     Intent priority (strict order):
       1. Complaint / escalation     → escalate immediately
       2. Human escalation request   → connect to counsellor
-      3. Factual question (RAG)     → answer ONLY, no follow-up
-      4. Admission intent           → start/resume qualification flow
-      5. Active qualification flow  → continue collecting data
-      6. General fallback           → short RAG answer
+      3. Hot lead (admission-ready) → instant admin alert + qualification
+      4. Factual question (RAG)     → answer ONLY, no follow-up
+      5. Admission intent           → start/resume qualification flow
+      6. Active qualification flow  → continue collecting data
+      7. General fallback           → short RAG answer
     """
     phone = ""  # Pre-init so fallback in except block can reference it
     try:
-        # Use typed body if available, fall back to raw request parsing
-        if body is not None:
-            payload = {"data": body.data}
-        else:
-            payload = await request.json()
-        logger.info("WEBHOOK_RECEIVED | payload_keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
+        logger.info(
+            "WEBHOOK_RECEIVED | payload_keys=%s",
+            list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+        )
 
         message, phone, user_name, message_type = _extract_from_payload(payload)
 
@@ -351,11 +412,11 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
         # ── Validation: only process TEXT messages ───────────────────
         if message_type != "TEXT":
             logger.info("IGNORED | phone=%s | reason=non-text (%s)", phone, message_type)
-            return {"status": "ignored", "reason": f"unsupported message_type: {message_type}"}
+            return
 
         if not message:
             logger.warning("IGNORED | phone=%s | reason=empty message", phone)
-            return {"status": "ignored", "reason": "empty message"}
+            return
 
         user_id = phone or "whatsapp_user"
 
@@ -406,6 +467,44 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
         )
 
         # =============================================================
+        # HOT-LEAD ALERT (runs alongside normal routing)
+        # =============================================================
+        # Fire a HIGH-priority admin ping the moment the user sends a
+        # buying-intent message (e.g. "fees negotiation", "I want to join",
+        # "call me now"). This must NOT block the user reply, so run it
+        # in the background. We still let the normal route continue so
+        # the user gets a proper conversational response.
+        if (
+            not has_complaint
+            and not has_human_req
+            and detect_hot_lead(message)
+        ):
+            lead_type_hot = classify_lead(message).value
+            add_internal_flag(user_id, "HOT_LEAD")
+            logger.info(
+                "HOT_LEAD | user=%s | phone=%s | type=%s",
+                user_id, phone, lead_type_hot,
+            )
+            asyncio.create_task(
+                notify_admin_hot_lead(
+                    user_phone=phone or "unknown",
+                    user_message=message,
+                    lead_type=lead_type_hot,
+                )
+            )
+            # Also log the hot lead to Google Sheet so it appears
+            # in the pipeline even before qualification completes.
+            zapier_fire_and_forget(build_quick_payload(
+                phone=phone or "unknown",
+                message=message,
+                lead_type=lead_type_hot,
+                priority="HIGH",
+                user_name=user_name,
+                score=get_score(user_id),
+                stage=stage.value if stage else "",
+            ))
+
+        # =============================================================
         # PRIORITY 1: Complaint / Escalation
         # =============================================================
         if route == Route.COMPLAINT:
@@ -421,12 +520,20 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 lead_type=lead_type,
                 reason="Complaint / Dissatisfaction",
             )
+            zapier_fire_and_forget(build_quick_payload(
+                phone=phone or "unknown",
+                message=message,
+                lead_type=lead_type,
+                priority="HIGH",
+                user_name=user_name,
+                score=get_score(user_id),
+                stage=stage.value if stage else "",
+            ))
             reply = "We're sorry to hear that. Our team will reach out to you shortly \U0001f64f"
             if phone:
                 await mark_followup_escalated(phone)
                 await send_whatsapp_message(phone, reply)
-
-            return {"status": "complaint", "answer": reply}
+            return
 
         # =============================================================
         # PRIORITY 2: Human Escalation
@@ -442,21 +549,17 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 lead_type=lead_type,
             )
 
-            try:
-                await send_lead_to_zapier(build_quick_payload(
-                    phone=phone or "unknown", message=message,
-                    lead_type=lead_type, user_name=user_name,
-                    score=get_score(user_id), stage=stage.value if stage else "",
-                ))
-            except Exception:
-                pass
+            zapier_fire_and_forget(build_quick_payload(
+                phone=phone or "unknown", message=message,
+                lead_type=lead_type, user_name=user_name,
+                score=get_score(user_id), stage=stage.value if stage else "",
+            ))
 
             reply = "Our counsellor will contact you shortly \U0001f44d"
             if phone:
                 await mark_followup_escalated(phone)
                 await send_whatsapp_message(phone, reply)
-
-            return {"status": "escalated", "answer": reply}
+            return
 
         # =============================================================
         # PRIORITY 3: Factual Question → RAG only, NO follow-up
@@ -478,7 +581,7 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                     await send_whatsapp_message(phone, current_prompt)
                 reply = rag_answer
                 logger.info("AI_RESPONSE | phone=%s | type=factual_midflow | response=\"%s\"", phone, reply[:120])
-                return {"status": "factual_midflow", "answer": reply}
+                return
 
             # Pure factual question — answer only, no qualification trigger
             try:
@@ -507,7 +610,7 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
                 await send_whatsapp_message(phone, answer)
 
             logger.info("AI_RESPONSE | phone=%s | type=factual | response=\"%s\"", phone, answer[:120])
-            return {"status": "factual", "answer": answer}
+            return
 
         # =============================================================
         # PRIORITY 4: Admission Intent → start/resume qualification
@@ -530,8 +633,7 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
 
             if phone:
                 await send_whatsapp_message(phone, qual_prompt)
-
-            return {"status": "qualification_started", "answer": qual_prompt}
+            return
 
         # =============================================================
         # PRIORITY 5: Active Qualification Flow
@@ -565,17 +667,13 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
 
                 await save_lead_to_db(lead)
                 await notify_admin_qualified_lead(lead)
-
-                try:
-                    await send_lead_to_zapier(build_lead_payload(lead, message))
-                except Exception:
-                    pass
+                zapier_fire_and_forget(build_lead_payload(lead, message))
 
                 if phone:
                     await mark_followup_completed(phone)
 
             logger.info("AI_RESPONSE | phone=%s | type=qualification | response=\"%s\"", phone, reply[:120])
-            return {"status": "qualification_step", "answer": reply}
+            return
 
         # =============================================================
         # PRIORITY 6: General Fallback → short RAG answer
@@ -607,17 +705,16 @@ async def whatsapp_webhook(request: Request, body: Optional[WhatsAppPayload] = N
             await send_whatsapp_message(phone, answer)
 
         logger.info("AI_RESPONSE | phone=%s | type=general | response=\"%s\"", phone, answer[:120])
-        return {"status": "ok", "answer": answer}
+        return
 
     except Exception as e:
-        logger.exception("Error in /whatsapp webhook")
+        logger.exception("Error processing WhatsApp message")
         if phone:
             try:
                 await send_whatsapp_message(phone, FALLBACK_MESSAGE)
                 logger.info("FALLBACK_SENT | phone=%s", phone)
             except Exception:
                 logger.error("FALLBACK_FAILED | phone=%s", phone)
-        return {"status": "error", "detail": str(e)}
 
 
 # =====================================================================

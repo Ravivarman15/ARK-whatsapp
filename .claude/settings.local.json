@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python -c 'import ast, os, sys *)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python *)"
     ]
   }
 }

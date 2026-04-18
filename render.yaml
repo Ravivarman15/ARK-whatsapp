@@ -18,7 +18,7 @@ services:
       - key: HF_API_TOKEN
         sync: false
       - key: LLM_MODEL
-        value: Qwen/Qwen2.5-72B-Instruct
+        value: meta-llama/Meta-Llama-3.1-8B-Instruct
       - key: AISENSY_API_KEY
         sync: false
       - key: AISENSY_PROJECT_ID

@@ -47,18 +47,20 @@ _WHATSAPP_WINDOW = 86400  # seconds
 
 FOLLOWUP_MESSAGES = {
     1: (
-        "Hi! Just checking in \U0001f44b\n"
-        "Would you like to know more about our programs?\n"
-        "Feel free to ask any question."
+        "Hi \U0001f60a just checking back!\n"
+        "Is there anything specific you'd like to know — classes, "
+        "schedule, or how we help students improve?\n"
+        "Happy to help."
     ),
     2: (
-        "We have limited slots this week \U0001f3af\n"
-        "Would you like to reserve one?\n"
-        "Reply 'Yes' to get started."
+        "Just a quick note \U0001f44b\n"
+        "Would it help if our counsellor gave you a short call to "
+        "walk you through the programme that fits your child best?"
     ),
     3: (
-        "Let us know if you need any help \U0001f64f\n"
-        "We can schedule a quick counselling call for you."
+        "No pressure at all \U0001f64f\n"
+        "Whenever you're ready, we're here — a 5-min counselling "
+        "call can clear most of your questions."
     ),
 }
 
