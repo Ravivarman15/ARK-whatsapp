@@ -21,6 +21,8 @@ services:
         value: meta-llama/Meta-Llama-3.1-8B-Instruct
       - key: AISENSY_API_KEY
         sync: false
+      - key: AISENSY_CAMPAIGN_API_KEY
+        sync: false
       - key: AISENSY_PROJECT_ID
         sync: false
       - key: AISENSY_CAMPAIGN_NAME

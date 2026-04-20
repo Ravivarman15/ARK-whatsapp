@@ -264,6 +264,12 @@ async def _deliver_admin_message(
     Uses the pre-approved `admin_alert` template (env AISENSY_CAMPAIGN_NAME).
     The template must accept exactly one free-text variable that carries
     the full lead summary — the payload passes it as `templateParams[0]`.
+
+    Auth: AiSensy's Campaign API needs its own JWT (AISENSY_CAMPAIGN_API_KEY).
+    That's a *different* credential from AISENSY_API_KEY (which is the
+    Project API password used for session sends). If AISENSY_CAMPAIGN_API_KEY
+    is missing, we fall back to AISENSY_API_KEY with a loud warning — that
+    fallback is usually wrong and will 401.
     """
     s = get_settings()
 
@@ -274,10 +280,18 @@ async def _deliver_admin_message(
         )
         return False
 
+    campaign_key = s.AISENSY_CAMPAIGN_API_KEY or s.AISENSY_API_KEY
+    if not s.AISENSY_CAMPAIGN_API_KEY:
+        logger.warning(
+            "ADMIN_CAMPAIGN_KEY_MISSING | %s | AISENSY_CAMPAIGN_API_KEY not set; "
+            "falling back to AISENSY_API_KEY (likely wrong credential — expect 401)",
+            context,
+        )
+
     destination = admin_phone if admin_phone.startswith("+") else f"+{admin_phone}"
     url = "https://backend.aisensy.com/campaign/t1/api/v2"
     payload = {
-        "apiKey": s.AISENSY_API_KEY,
+        "apiKey": campaign_key,
         "campaignName": s.AISENSY_CAMPAIGN_NAME,
         "destination": destination,
         "userName": "Admin",
@@ -290,10 +304,19 @@ async def _deliver_admin_message(
             if resp.status_code in (200, 201):
                 logger.info("ADMIN_NOTIFIED | %s | channel=campaign", context)
                 return True
-            logger.error(
-                "ADMIN_CAMPAIGN_FAIL | %s | status=%d | body=%s",
-                context, resp.status_code, resp.text[:400],
-            )
+            if resp.status_code == 401:
+                logger.error(
+                    "ADMIN_CAMPAIGN_FAIL | %s | status=401 Unauthorized | "
+                    "AISENSY_CAMPAIGN_API_KEY is likely missing or wrong. "
+                    "Copy the JWT from AiSensy dashboard → Manage → API Keys "
+                    "(it should start with 'eyJ').",
+                    context,
+                )
+            else:
+                logger.error(
+                    "ADMIN_CAMPAIGN_FAIL | %s | status=%d | body=%s",
+                    context, resp.status_code, resp.text[:400],
+                )
             return False
     except Exception as e:
         logger.exception("ADMIN_CAMPAIGN_ERROR | %s | %s", context, e)

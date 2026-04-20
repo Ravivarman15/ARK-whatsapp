@@ -537,40 +537,81 @@ def update_lead_intelligence(user_id: str, stage: str = "", persona: str = "") -
 # Supabase Lead Storage
 # =====================================================================
 
+# Columns that every ark_leads table is expected to have. If the insert
+# with intelligence fields fails because the schema is older, we retry
+# with just these core columns so the lead is never lost.
+_CORE_LEAD_COLUMNS = {
+    "phone", "student_name", "class", "school", "parent_phone",
+    "course", "lead_type", "priority", "message", "created_at",
+}
+
+
 async def save_lead_to_db(lead: LeadData) -> bool:
     """
     Save a completed lead to the Supabase `ark_leads` table.
+
+    First tries the full row (core + intelligence columns). If Supabase
+    rejects it because the table is missing the intelligence columns
+    (PGRST204 "Could not find the 'X' column"), retries with only the
+    core columns so the lead still lands.
 
     Returns True if saved successfully, False otherwise.
     """
     from rag.retriever import get_supabase_client
 
+    client = get_supabase_client()
+    full_row = {
+        "phone": lead.phone,
+        "student_name": lead.student_name,
+        "class": lead.student_class,
+        "school": lead.school,
+        "parent_phone": lead.parent_phone,
+        "course": lead.course,
+        "lead_type": lead.lead_type,
+        "priority": lead.priority,
+        "message": "",
+        "created_at": datetime.now().isoformat(),
+        # Intelligence fields
+        "segment": lead.segment,
+        "stage": lead.stage,
+        "lead_score": lead.lead_score,
+        "lead_score_type": lead.lead_score_type,
+        "persona": lead.persona,
+        "concern": lead.concern,
+    }
+
     try:
-        client = get_supabase_client()
-        row = {
-            "phone": lead.phone,
-            "student_name": lead.student_name,
-            "class": lead.student_class,
-            "school": lead.school,
-            "parent_phone": lead.parent_phone,
-            "course": lead.course,
-            "lead_type": lead.lead_type,
-            "priority": lead.priority,
-            "message": "",
-            "created_at": datetime.now().isoformat(),
-            # Intelligence fields
-            "segment": lead.segment,
-            "stage": lead.stage,
-            "lead_score": lead.lead_score,
-            "lead_score_type": lead.lead_score_type,
-            "persona": lead.persona,
-            "concern": lead.concern,
-        }
-        client.table("ark_leads").insert(row).execute()
-        logger.info("LEAD_SAVED | phone=%s | name=%s | score=%d", lead.phone, lead.student_name, lead.lead_score)
+        client.table("ark_leads").insert(full_row).execute()
+        logger.info(
+            "LEAD_SAVED | phone=%s | name=%s | score=%d",
+            lead.phone, lead.student_name, lead.lead_score,
+        )
         return True
     except Exception as e:
-        logger.error("Failed to save lead to DB: %s", e)
+        err_msg = str(e)
+        schema_mismatch = "PGRST204" in err_msg or "Could not find the" in err_msg
+        if not schema_mismatch:
+            logger.error("Failed to save lead to DB: %s", e)
+            return False
+
+        logger.warning(
+            "LEAD_SAVE_SCHEMA_MISMATCH | %s — retrying with core columns only. "
+            "Run scripts/add_ark_leads_intelligence_columns.sql on Supabase to "
+            "stop losing intelligence fields.",
+            err_msg[:200],
+        )
+
+    # Retry path: insert only columns that definitely exist in the table
+    core_row = {k: v for k, v in full_row.items() if k in _CORE_LEAD_COLUMNS}
+    try:
+        client.table("ark_leads").insert(core_row).execute()
+        logger.info(
+            "LEAD_SAVED | phone=%s | name=%s | score=%d | mode=core_only",
+            lead.phone, lead.student_name, lead.lead_score,
+        )
+        return True
+    except Exception as e:
+        logger.error("Failed to save lead to DB (core retry): %s", e)
         return False
 
 

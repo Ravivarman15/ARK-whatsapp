@@ -41,7 +41,16 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     # ── AiSensy (WhatsApp) ───────────────────────────────────────
-    AISENSY_API_KEY: str = ""                  # AiSensy Project API key
+    # AiSensy uses TWO separate credentials — do not confuse them:
+    #   AISENSY_API_KEY         — Project API password (short hex)
+    #                             → used by Project API session sends
+    #                               (apis.aisensy.com/project-apis/…)
+    #   AISENSY_CAMPAIGN_API_KEY — Campaign API JWT (long eyJ… token)
+    #                             → used by Campaign template sends
+    #                               (backend.aisensy.com/campaign/…)
+    # Copy the Campaign API Key from AiSensy dashboard → Manage → API Keys.
+    AISENSY_API_KEY: str = ""                  # Project API password
+    AISENSY_CAMPAIGN_API_KEY: str = ""         # Campaign API JWT (for admin alerts / follow-ups)
     AISENSY_PROJECT_ID: str = ""               # AiSensy project ID (for session replies)
     AISENSY_CAMPAIGN_NAME: str = ""            # Campaign name for template messages (follow-ups / admin alerts)
 

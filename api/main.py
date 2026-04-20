@@ -345,9 +345,15 @@ async def admin_test():
         "admin_phone_valid": True,
         "admin_phone_masked": s.ADMIN_WHATSAPP_NUMBER[:4] + "****" + s.ADMIN_WHATSAPP_NUMBER[-3:],
         "aisensy_api_key_set": bool(s.AISENSY_API_KEY),
+        "aisensy_campaign_api_key_set": bool(s.AISENSY_CAMPAIGN_API_KEY),
         "aisensy_project_id_set": bool(s.AISENSY_PROJECT_ID),
         "aisensy_campaign_name": s.AISENSY_CAMPAIGN_NAME or None,
-        "note": "Check server logs for ADMIN_NOTIFIED / ADMIN_SESSION_SEND_FAILED / ADMIN_CAMPAIGN_FAIL lines.",
+        "note": (
+            "If sent=false and aisensy_campaign_api_key_set=false, you're using "
+            "the Project API password against the Campaign API — grab the JWT "
+            "from AiSensy dashboard → Manage → API Keys and set "
+            "AISENSY_CAMPAIGN_API_KEY. Check logs for ADMIN_CAMPAIGN_FAIL body."
+        ),
     }
 
 
