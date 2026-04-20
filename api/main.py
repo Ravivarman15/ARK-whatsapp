@@ -312,6 +312,45 @@ async def health():
     return {"status": "ok", "version": "4.0.0"}
 
 
+@app.post("/admin/test")
+async def admin_test():
+    """
+    Diagnostic — fire a synthetic hot-lead admin notification so you
+    can verify ADMIN_WHATSAPP_NUMBER, AiSensy credentials, and the
+    session/template delivery chain without having to simulate a real
+    user message.
+
+    Returns the delivery result + reason if it failed so misconfig is
+    visible in the response (not just in logs).
+    """
+    from rag.escalation import _is_valid_admin_phone
+    from rag.lead_manager import notify_admin_hot_lead
+
+    s = get_settings()
+    ok, reason = _is_valid_admin_phone(s.ADMIN_WHATSAPP_NUMBER)
+    if not ok:
+        return {
+            "sent": False,
+            "admin_phone_valid": False,
+            "reason": reason,
+        }
+
+    delivered = await notify_admin_hot_lead(
+        user_phone="919000000000",
+        user_message="[diagnostic test from /admin/test]",
+        lead_type="Diagnostic",
+    )
+    return {
+        "sent": delivered,
+        "admin_phone_valid": True,
+        "admin_phone_masked": s.ADMIN_WHATSAPP_NUMBER[:4] + "****" + s.ADMIN_WHATSAPP_NUMBER[-3:],
+        "aisensy_api_key_set": bool(s.AISENSY_API_KEY),
+        "aisensy_project_id_set": bool(s.AISENSY_PROJECT_ID),
+        "aisensy_campaign_name": s.AISENSY_CAMPAIGN_NAME or None,
+        "note": "Check server logs for ADMIN_NOTIFIED / ADMIN_SESSION_SEND_FAILED / ADMIN_CAMPAIGN_FAIL lines.",
+    }
+
+
 @app.post("/zapier/test")
 async def zapier_test():
     """
@@ -485,12 +524,19 @@ async def _process_incoming_message(payload: dict) -> None:
                 "HOT_LEAD | user=%s | phone=%s | type=%s",
                 user_id, phone, lead_type_hot,
             )
+
+            async def _safe_hot_lead_notify(p: str, m: str, t: str) -> None:
+                try:
+                    ok = await notify_admin_hot_lead(
+                        user_phone=p, user_message=m, lead_type=t,
+                    )
+                    if not ok:
+                        logger.error("HOT_LEAD_NOTIFY_FAILED | user=%s | type=%s", p, t)
+                except Exception as exc:
+                    logger.exception("HOT_LEAD_NOTIFY_ERROR | user=%s | %s", p, exc)
+
             asyncio.create_task(
-                notify_admin_hot_lead(
-                    user_phone=phone or "unknown",
-                    user_message=message,
-                    lead_type=lead_type_hot,
-                )
+                _safe_hot_lead_notify(phone or "unknown", message, lead_type_hot)
             )
             # Also log the hot lead to Google Sheet so it appears
             # in the pipeline even before qualification completes.
@@ -572,7 +618,7 @@ async def _process_incoming_message(payload: dict) -> None:
                     rag_answer = await ask_async(question=message, user_id=user_id)
                     rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
                 except Exception as rag_err:
-                    logger.error("RAG_ERROR (factual_midflow) | %s", rag_err)
+                    logger.exception("RAG_ERROR (factual_midflow) | %s: %s", type(rag_err).__name__, rag_err)
                     rag_answer = RAG_ERROR_MESSAGE
                 current_prompt = get_current_qual_prompt(user_id)
                 # Send answer and re-prompt as separate messages for clarity
@@ -588,7 +634,7 @@ async def _process_incoming_message(payload: dict) -> None:
                 answer = await ask_async(question=message, user_id=user_id)
                 answer = format_whatsapp_response(answer, is_factual=True)
             except Exception as rag_err:
-                logger.error("RAG_ERROR (factual) | %s", rag_err)
+                logger.exception("RAG_ERROR (factual) | %s: %s", type(rag_err).__name__, rag_err)
                 answer = RAG_ERROR_MESSAGE
 
             # Check for confusion escalation
@@ -647,7 +693,7 @@ async def _process_incoming_message(payload: dict) -> None:
                     rag_answer = await ask_async(question=message, user_id=user_id)
                     rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
                 except Exception as rag_err:
-                    logger.error("RAG_ERROR (qual_midflow) | %s", rag_err)
+                    logger.exception("RAG_ERROR (qual_midflow) | %s: %s", type(rag_err).__name__, rag_err)
                     rag_answer = RAG_ERROR_MESSAGE
                 current_prompt = get_current_qual_prompt(user_id)
                 if phone:
@@ -682,7 +728,7 @@ async def _process_incoming_message(payload: dict) -> None:
             answer = await ask_async(question=message, user_id=user_id)
             answer = format_whatsapp_response(answer, is_factual=False)
         except Exception as rag_err:
-            logger.error("RAG_ERROR (general) | %s", rag_err)
+            logger.exception("RAG_ERROR (general) | %s: %s", type(rag_err).__name__, rag_err)
             answer = RAG_ERROR_MESSAGE
 
         # Confusion escalation

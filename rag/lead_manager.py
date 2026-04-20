@@ -29,8 +29,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-import httpx
-
 from config.settings import get_settings
 
 logger = logging.getLogger("ark.leads")
@@ -582,15 +580,23 @@ async def save_lead_to_db(lead: LeadData) -> bool:
 
 async def notify_admin_qualified_lead(lead: LeadData) -> bool:
     """Send a qualified lead notification to the admin's WhatsApp."""
+    from rag.escalation import _deliver_admin_message, _is_valid_admin_phone
+
     s = get_settings()
     admin_phone = s.ADMIN_WHATSAPP_NUMBER
-    if not admin_phone or not s.AISENSY_API_KEY:
-        logger.warning("Admin phone or AiSensy API key not set.")
+    ok, reason = _is_valid_admin_phone(admin_phone)
+    if not ok:
+        logger.error("ADMIN_NOTIFY_BLOCKED | qualified_lead | %s", reason)
+        return False
+    if not s.AISENSY_API_KEY:
+        logger.error("ADMIN_NOTIFY_BLOCKED | qualified_lead | AISENSY_API_KEY not set")
         return False
 
     admin_message = generate_counsellor_summary(lead)
-
-    return await _send_admin_message(admin_phone, admin_message, "ark_qualified_lead")
+    return await _deliver_admin_message(
+        admin_phone, admin_message,
+        context=f"qualified_lead phone={lead.phone} name={lead.student_name}",
+    )
 
 
 async def notify_admin_hot_lead(
@@ -599,9 +605,22 @@ async def notify_admin_hot_lead(
     lead_type: str = "",
 ) -> bool:
     """Send a hot lead notification to the admin's WhatsApp."""
+    from rag.escalation import _deliver_admin_message, _is_valid_admin_phone
+
     s = get_settings()
     admin_phone = s.ADMIN_WHATSAPP_NUMBER
-    if not admin_phone or not s.AISENSY_API_KEY:
+    ok, reason = _is_valid_admin_phone(admin_phone)
+    if not ok:
+        logger.error(
+            "ADMIN_NOTIFY_BLOCKED | hot_lead | user=%s | %s",
+            user_phone, reason,
+        )
+        return False
+    if not s.AISENSY_API_KEY:
+        logger.error(
+            "ADMIN_NOTIFY_BLOCKED | hot_lead | user=%s | AISENSY_API_KEY not set",
+            user_phone,
+        )
         return False
 
     admin_message = (
@@ -613,34 +632,7 @@ async def notify_admin_hot_lead(
         "*Contact immediately.*"
     )
 
-    return await _send_admin_message(admin_phone, admin_message, "ark_hot_lead")
-
-
-async def _send_admin_message(admin_phone: str, message: str, callback_data: str) -> bool:
-    """Internal helper to send a WhatsApp message to admin via AiSensy Campaign API."""
-    s = get_settings()
-
-    # Ensure admin phone has '+' prefix
-    destination = admin_phone if admin_phone.startswith("+") else f"+{admin_phone}"
-
-    url = "https://backend.aisensy.com/campaign/t1/api/v2"
-    payload = {
-        "apiKey": s.AISENSY_API_KEY,
-        "campaignName": s.AISENSY_CAMPAIGN_NAME,
-        "destination": destination,
-        "userName": "Admin",
-        "templateParams": [message],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code in (200, 201):
-                logger.info("Admin notification sent (%s)", callback_data)
-                return True
-            else:
-                logger.error("AiSensy error (%d): %s", resp.status_code, resp.text)
-                return False
-    except Exception as e:
-        logger.error("Admin notification failed: %s", e)
-        return False
+    return await _deliver_admin_message(
+        admin_phone, admin_message,
+        context=f"hot_lead user={user_phone} type={lead_type}",
+    )

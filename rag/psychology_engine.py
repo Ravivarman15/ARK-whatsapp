@@ -229,31 +229,44 @@ def reset_triggers(user_id: str) -> None:
 TAMIL_WORDS = [
     "evlo", "enna", "epdi", "enga", "yaar", "edhu",
     "sollunga", "sollu", "theriyum", "theriyala",
-    "nalla", "romba", "konjam", "illai", "irukku",
-    "vendum", "mudiyum", "mudiyala", "vaanga",
-    "ponga", "pannunga", "solra", "padikka",
-    "fees", "class", "school",  # common Tamil-English mix
-    "enakku", "enga", "paiyan", "ponnu",
-    "eppadi", "ethuku", "yen",
+    "nalla", "romba", "konjam", "illai", "irukku", "iruku",
+    "vendum", "mudiyum", "mudiyala", "vaanga", "vanga",
+    "ponga", "pannunga", "panringa", "pannuringa",
+    "solra", "padikka", "panni", "panra",
+    "enakku", "paiyan", "ponnu", "neenga",
+    "eppadi", "ethuku", "yen", "ipo",
+    "chumma", "kashtam", "marikku",
 ]
 
 # Tamil Unicode range (basic)
 _TAMIL_UNICODE = re.compile(r"[\u0B80-\u0BFF]")
 
 
-def detect_tamil(message: str) -> bool:
-    """
-    Detect if a message is likely in Tamil (words or script).
+LANG_ENGLISH = "english"
+LANG_THANGLISH = "thanglish"
+LANG_TAMIL = "tamil"
 
-    Returns True if Tamil is detected.
+
+def detect_language(message: str) -> str:
+    """
+    Classify the user's message as one of: 'english', 'thanglish', 'tamil'.
+
+    Rules:
+      - Any Tamil Unicode character → 'tamil'
+      - >=2 Thanglish words, or a short (≤3 word) message with >=1 → 'thanglish'
+      - Otherwise → 'english'
     """
     msg = message.lower().strip()
-
-    # Check Tamil Unicode characters
     if _TAMIL_UNICODE.search(msg):
-        return True
+        return LANG_TAMIL
 
-    # Check Tamil transliteration words
     words = msg.split()
     tamil_count = sum(1 for w in words if w in TAMIL_WORDS)
-    return tamil_count >= 2 or (len(words) <= 3 and tamil_count >= 1)
+    if tamil_count >= 2 or (len(words) <= 3 and tamil_count >= 1):
+        return LANG_THANGLISH
+    return LANG_ENGLISH
+
+
+def detect_tamil(message: str) -> bool:
+    """Backward-compatible: True when message is Tamil OR Thanglish."""
+    return detect_language(message) in (LANG_TAMIL, LANG_THANGLISH)

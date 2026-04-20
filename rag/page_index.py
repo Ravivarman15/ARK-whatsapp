@@ -181,6 +181,15 @@ def get_index(index_path: str | Path = INDEX_PATH) -> Optional[dict]:
 # Search
 # =====================================================================
 
+def all_chunks(index_path: str | Path = INDEX_PATH, limit: int = 5) -> list[str]:
+    """Return up to `limit` chunks verbatim — used as a Tamil/Thanglish fallback
+    when TF-IDF (English-token) search can't match non-Latin script queries."""
+    index = get_index(index_path)
+    if index is None:
+        return []
+    return [c["text"] for c in index["chunks"][:limit]]
+
+
 def search_index(
     query: str,
     k: int = 3,

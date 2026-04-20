@@ -68,8 +68,8 @@ class Settings(BaseSettings):
 
     # ── Performance ───────────────────────────────────────────────
     # Tight budget: we need WhatsApp replies in <2s end-to-end.
-    HF_TIMEOUT: int = 8          # Seconds before HuggingFace call is aborted
-    MAX_NEW_TOKENS: int = 120    # WhatsApp-friendly short responses (≤4 lines)
+    HF_TIMEOUT: int = 15         # Seconds before HuggingFace call is aborted
+    MAX_NEW_TOKENS: int = 260    # WhatsApp-friendly; room for full course lists / overview answers
 
     # ── Follow-Up Automation (within 24-hour WhatsApp window) ─────
     FOLLOWUP_STAGE1_DELAY: int = 1800        # Seconds before 1st follow-up (30 min)

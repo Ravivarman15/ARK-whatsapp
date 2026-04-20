@@ -32,7 +32,7 @@ from huggingface_hub import InferenceClient
 from supabase import create_client, Client
 
 from config.settings import get_settings
-from rag.page_index import search_index
+from rag.page_index import search_index, all_chunks
 from rag.cache import get_cache
 
 logger = logging.getLogger("ark.retriever")
@@ -112,19 +112,24 @@ SYSTEM_INSTRUCTION = (
     "- Conversational English, simple words, no jargon\n"
     "- Use 1 emoji max per reply (😊 🙌 ✨ 📘 🎯 🔥) — only when it adds warmth\n\n"
     "HOW YOU FORMAT (WhatsApp rules — MUST follow):\n"
-    "- 3-5 short lines, never a wall of text\n"
+    "- Short lines, no walls of text\n"
     "- Open with a small hook / acknowledgement (1 line)\n"
-    "- 2-3 crisp bullets with the key facts (use • not dashes)\n"
+    "- Bullets for facts (use • not dashes)\n"
+    "- For general questions → 2-3 crisp bullets\n"
+    "- For overview questions (\"tell me about ARK\", \"who are you\", \"about institute\") "
+    "→ list ALL the key points from context (intro line + every course/feature as a bullet)\n"
+    "- For list questions (\"what courses\", \"what programs\", \"what classes\", \"what features\") "
+    "→ list EVERY item from context — do NOT stop at 2-3\n"
     "- End with ONE soft, curious question that invites the next reply\n"
     "- Never include '— Team ARK' signatures\n\n"
     "HOW YOU ANSWER:\n"
     "- Use ONLY the CONTEXT below for facts — never invent details\n"
+    "- When the context lists items (courses, programs, features), include EVERY item — never truncate a list\n"
     "- If the context does not cover it, say: \"Let me get our counsellor to share "
     "the exact details with you\" and gently ask for their phone/class\n"
     "- Never quote specific fee amounts — say \"our counsellor can walk you through "
     "the fee structure based on the class\" and offer a callback\n"
-    "- Never guarantee marks/ranks; talk about ARK's proven system instead\n"
-    "- Match the user's language: if they type in Tamil, reply in Tamil\n\n"
+    "- Never guarantee marks/ranks; talk about ARK's proven system instead\n\n"
     "EXAMPLE REPLY (copy this vibe, not the content):\n"
     "\"Great question! 😊\n"
     "Here's what makes ARK different:\n"
@@ -139,6 +144,27 @@ SYSTEM_INSTRUCTION = (
 # Message Builder
 # =====================================================================
 
+_LANG_DIRECTIVE = {
+    "english": (
+        "\nLANGUAGE LOCK: The user wrote in English. "
+        "You MUST reply ONLY in English. "
+        "Do NOT use Tamil script (Unicode) or Tamil transliteration words "
+        "(evlo, enna, nalla, irukku, vanga, etc.). Pure English only."
+    ),
+    "thanglish": (
+        "\nLANGUAGE LOCK: The user wrote in Thanglish (Tamil words in English letters). "
+        "You MUST reply ONLY in Thanglish — Tamil words written in English letters. "
+        "Do NOT use Tamil Unicode script. Do NOT reply in pure English. "
+        "Example style: \"Vanga! Namma ARK la NEET batch iruku, fees details counsellor share pannuvanga.\""
+    ),
+    "tamil": (
+        "\nLANGUAGE LOCK: The user wrote in Tamil (Unicode script). "
+        "You MUST reply ONLY in Tamil Unicode script (தமிழ்). "
+        "Do NOT reply in English or Thanglish (romanized Tamil)."
+    ),
+}
+
+
 def _build_messages(
     question: str,
     context_chunks: list[str],
@@ -146,7 +172,7 @@ def _build_messages(
     stage_instruction: str = "",
     persona_instruction: str = "",
     trigger_line: str = "",
-    is_tamil: bool = False,
+    language: str = "english",
 ) -> list[dict]:
     sys_parts = [SYSTEM_INSTRUCTION]
 
@@ -156,12 +182,7 @@ def _build_messages(
     if persona_instruction:
         sys_parts.append(f"\nPARENT TYPE:\n{persona_instruction}")
 
-    if is_tamil:
-        sys_parts.append(
-            "\nLANGUAGE: The user is communicating in Tamil. "
-            "Respond in Tamil (transliterated or Unicode) while maintaining "
-            "the same authoritative and professional tone."
-        )
+    sys_parts.append(_LANG_DIRECTIVE.get(language, _LANG_DIRECTIVE["english"]))
 
     if trigger_line:
         sys_parts.append(
@@ -184,6 +205,10 @@ def _build_messages(
 # LLM Answer Generation
 # =====================================================================
 
+_HF_MAX_ATTEMPTS = 3
+_HF_RETRY_BACKOFF = 0.7  # seconds; doubles each attempt
+
+
 def generate_answer(
     question: str,
     context_chunks: list[str],
@@ -191,7 +216,7 @@ def generate_answer(
     stage_instruction: str = "",
     persona_instruction: str = "",
     trigger_line: str = "",
-    is_tamil: bool = False,
+    language: str = "english",
 ) -> str:
     s = get_settings()
     client = get_hf_client()
@@ -200,25 +225,35 @@ def generate_answer(
         stage_instruction=stage_instruction,
         persona_instruction=persona_instruction,
         trigger_line=trigger_line,
-        is_tamil=is_tamil,
+        language=language,
     )
 
-    try:
-        response = client.chat_completion(
-            model=s.LLM_MODEL,
-            messages=messages,
-            max_tokens=s.MAX_NEW_TOKENS,
-            temperature=0.3,
-            top_p=0.9,
-        )
-        if response.choices:
-            content = response.choices[0].message.content
-            if content:
-                return content.strip()
-        return "Sorry, I was unable to generate a response. Please try again."
-    except Exception as e:
-        logger.error("LLM generation failed: %s", e)
-        raise RuntimeError(f"HuggingFace API error: {e}")
+    last_err: Optional[Exception] = None
+    for attempt in range(1, _HF_MAX_ATTEMPTS + 1):
+        try:
+            response = client.chat_completion(
+                model=s.LLM_MODEL,
+                messages=messages,
+                max_tokens=s.MAX_NEW_TOKENS,
+                temperature=0.3,
+                top_p=0.9,
+            )
+            if response.choices:
+                content = response.choices[0].message.content
+                if content:
+                    return content.strip()
+            return "Sorry, I was unable to generate a response. Please try again."
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "LLM attempt %d/%d failed: %s: %s",
+                attempt, _HF_MAX_ATTEMPTS, type(e).__name__, e,
+            )
+            if attempt < _HF_MAX_ATTEMPTS:
+                time.sleep(_HF_RETRY_BACKOFF * attempt)
+
+    logger.error("LLM generation failed after %d attempts: %s", _HF_MAX_ATTEMPTS, last_err)
+    raise RuntimeError(f"HuggingFace API error: {last_err}")
 
 
 async def generate_answer_async(
@@ -228,7 +263,7 @@ async def generate_answer_async(
     stage_instruction: str = "",
     persona_instruction: str = "",
     trigger_line: str = "",
-    is_tamil: bool = False,
+    language: str = "english",
 ) -> str:
     # Run the blocking HF call in a worker thread so we don't freeze
     # the event loop — critical for concurrent webhook throughput.
@@ -238,7 +273,7 @@ async def generate_answer_async(
         stage_instruction,
         persona_instruction,
         trigger_line,
-        is_tamil,
+        language,
     )
 
 
@@ -250,6 +285,51 @@ NO_CONTEXT_MSG = (
     "I'm sorry, I couldn't find relevant information in our knowledge base. "
     "Please contact ARK Learning Arena directly for assistance."
 )
+
+
+# Questions asking for a broad overview or a full list need more context than
+# a 3-chunk TF-IDF window — bump top_k so every course/feature reaches the LLM.
+_BROAD_QUERY_MARKERS = (
+    "tell me about", "about ark", "about the institute", "about your institute",
+    "about you", "who are you", "who r you", "introduce",
+    "what courses", "which courses", "list courses", "all courses",
+    "what programs", "what programmes", "list programs",
+    "what classes", "what batches", "all batches",
+    "what features", "what do you offer", "what do you provide",
+    "courses you provide", "courses are you providing",
+    "courses do you provide", "courses do you offer",
+    "services", "facilities",
+)
+
+
+def _is_broad_query(question: str) -> bool:
+    q = question.lower()
+    return any(marker in q for marker in _BROAD_QUERY_MARKERS)
+
+
+def _retrieve_context(question: str, top_k: int, language: str) -> list[str]:
+    """
+    TF-IDF retrieval with two fallbacks:
+      1. Broad-query boost: list/overview questions use a larger k so the
+         full course catalogue reaches the LLM instead of being cut to 3.
+      2. Tamil/Thanglish empty-result fallback: the TF-IDF index is
+         English-tokenised, so Tamil Unicode queries score 0 against every
+         chunk. When retrieval comes back empty for a non-English query,
+         hand the first few chunks to the LLM so it has *something* to
+         answer from (language lock still enforces Tamil/Thanglish reply).
+    """
+    k = max(top_k, 6) if _is_broad_query(question) else top_k
+    chunks = search_index(question, k=k)
+
+    if not chunks and language in ("tamil", "thanglish"):
+        chunks = all_chunks(limit=max(k, 5))
+        if chunks:
+            logger.info(
+                "RETRIEVAL_FALLBACK | lang=%s | used all_chunks (n=%d) — TF-IDF empty",
+                language, len(chunks),
+            )
+
+    return chunks
 
 
 async def ask_async(
@@ -270,7 +350,7 @@ async def ask_async(
     from rag.stage_detector import detect_and_update_stage, get_stage_instruction
     from rag.persona_detector import detect_and_update_persona, get_persona_instruction
     from rag.psychology_engine import (
-        should_inject_trigger, get_next_trigger, detect_tamil,
+        should_inject_trigger, get_next_trigger, detect_language,
     )
     from rag.scoring import score_from_message
 
@@ -292,7 +372,7 @@ async def ask_async(
     persona = detect_and_update_persona(user_id, question)
     persona_inst = get_persona_instruction(persona)
 
-    is_tamil = detect_tamil(question)
+    language = detect_language(question)
     score_from_message(user_id, question)
 
     trigger_line = ""
@@ -301,7 +381,7 @@ async def ask_async(
 
     # Step 3: Page index search (fast, in-memory)
     t0 = time.perf_counter()
-    context_chunks = search_index(question, k=top_k)
+    context_chunks = _retrieve_context(question, top_k=top_k, language=language)
     search_time = (time.perf_counter() - t0) * 1000
 
     if not context_chunks:
@@ -319,12 +399,17 @@ async def ask_async(
                 stage_instruction=stage_inst,
                 persona_instruction=persona_inst,
                 trigger_line=trigger_line,
-                is_tamil=is_tamil,
+                language=language,
             ),
             timeout=s.HF_TIMEOUT,
         )
     except asyncio.TimeoutError:
         logger.error("LLM_TIMEOUT | user=%s | timeout=%ds", user_id, s.HF_TIMEOUT)
+        return (
+            "Thanks for reaching out! Our team will get back to you shortly \U0001f64f"
+        )
+    except RuntimeError as e:
+        logger.error("LLM_FAILED | user=%s | %s", user_id, e)
         return (
             "Thanks for reaching out! Our team will get back to you shortly \U0001f64f"
         )
@@ -337,9 +422,9 @@ async def ask_async(
     memory.add_turn(user_id, question, answer)
 
     logger.info(
-        "PERF | user=%s | stage=%s | persona=%s | tamil=%s | "
+        "PERF | user=%s | stage=%s | persona=%s | lang=%s | "
         "search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
-        user_id, stage.value, persona.value, is_tamil,
+        user_id, stage.value, persona.value, language,
         search_time, llm_time, total_time,
     )
 
@@ -351,7 +436,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
     from rag.stage_detector import detect_and_update_stage, get_stage_instruction
     from rag.persona_detector import detect_and_update_persona, get_persona_instruction
     from rag.psychology_engine import (
-        should_inject_trigger, get_next_trigger, detect_tamil,
+        should_inject_trigger, get_next_trigger, detect_language,
     )
     from rag.scoring import score_from_message
 
@@ -371,7 +456,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
     persona = detect_and_update_persona(user_id, question)
     persona_inst = get_persona_instruction(persona)
 
-    is_tamil = detect_tamil(question)
+    language = detect_language(question)
     score_from_message(user_id, question)
 
     trigger_line = ""
@@ -379,7 +464,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
         trigger_line = get_next_trigger(user_id)
 
     t0 = time.perf_counter()
-    context_chunks = search_index(question, k=top_k)
+    context_chunks = _retrieve_context(question, top_k=top_k, language=language)
     search_time = (time.perf_counter() - t0) * 1000
 
     if not context_chunks:
@@ -392,7 +477,7 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
         stage_instruction=stage_inst,
         persona_instruction=persona_inst,
         trigger_line=trigger_line,
-        is_tamil=is_tamil,
+        language=language,
     )
     llm_time = (time.perf_counter() - t0) * 1000
 
@@ -401,9 +486,9 @@ def ask(question: str, user_id: str = "anonymous", top_k: int = 3) -> str:
     memory.add_turn(user_id, question, answer)
 
     logger.info(
-        "PERF | user=%s | stage=%s | persona=%s | tamil=%s | "
+        "PERF | user=%s | stage=%s | persona=%s | lang=%s | "
         "search_ms=%.1f | llm_ms=%.1f | total_ms=%.1f",
-        user_id, stage.value, persona.value, is_tamil,
+        user_id, stage.value, persona.value, language,
         search_time, llm_time, total_time,
     )
 

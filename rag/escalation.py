@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -235,6 +234,72 @@ def _set_cooldown(phone: str) -> None:
 # Admin Notification
 # =====================================================================
 
+def _is_valid_admin_phone(phone: str) -> tuple[bool, str]:
+    """
+    Validate that the configured admin phone is an actual E.164 number,
+    not an empty string or a placeholder like '919xxxxxxxxx'.
+
+    Returns:
+        (is_valid, reason) — reason is populated only on failure.
+    """
+    if not phone:
+        return False, "ADMIN_WHATSAPP_NUMBER is empty"
+    digits = phone.lstrip("+")
+    if not digits.isdigit():
+        return False, f"ADMIN_WHATSAPP_NUMBER contains non-digits: {phone!r}"
+    if len(digits) < 10:
+        return False, f"ADMIN_WHATSAPP_NUMBER too short ({len(digits)} digits): {phone!r}"
+    return True, ""
+
+
+async def _deliver_admin_message(
+    admin_phone: str,
+    message: str,
+    *,
+    context: str,
+) -> bool:
+    """
+    Deliver a message to the admin via the AiSensy Campaign API.
+
+    Uses the pre-approved `admin_alert` template (env AISENSY_CAMPAIGN_NAME).
+    The template must accept exactly one free-text variable that carries
+    the full lead summary — the payload passes it as `templateParams[0]`.
+    """
+    s = get_settings()
+
+    if not s.AISENSY_CAMPAIGN_NAME:
+        logger.error(
+            "ADMIN_NOTIFY_BLOCKED | %s | AISENSY_CAMPAIGN_NAME not set",
+            context,
+        )
+        return False
+
+    destination = admin_phone if admin_phone.startswith("+") else f"+{admin_phone}"
+    url = "https://backend.aisensy.com/campaign/t1/api/v2"
+    payload = {
+        "apiKey": s.AISENSY_API_KEY,
+        "campaignName": s.AISENSY_CAMPAIGN_NAME,
+        "destination": destination,
+        "userName": "Admin",
+        "templateParams": [message],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code in (200, 201):
+                logger.info("ADMIN_NOTIFIED | %s | channel=campaign", context)
+                return True
+            logger.error(
+                "ADMIN_CAMPAIGN_FAIL | %s | status=%d | body=%s",
+                context, resp.status_code, resp.text[:400],
+            )
+            return False
+    except Exception as e:
+        logger.exception("ADMIN_CAMPAIGN_ERROR | %s | %s", context, e)
+        return False
+
+
 async def notify_admin(
     user_phone: str,
     user_message: str,
@@ -269,16 +334,22 @@ async def notify_admin(
         return False
 
     admin_phone = s.ADMIN_WHATSAPP_NUMBER
-    if not admin_phone:
-        logger.warning("ADMIN_WHATSAPP_NUMBER not set — cannot notify admin.")
+    ok, reason_invalid = _is_valid_admin_phone(admin_phone)
+    if not ok:
+        logger.error(
+            "ADMIN_NOTIFY_BLOCKED | user=%s | %s — fix .env before alerts can be sent",
+            user_phone, reason_invalid,
+        )
         return False
 
     if not s.AISENSY_API_KEY:
-        logger.warning("AISENSY_API_KEY not set — cannot send admin notification.")
+        logger.error(
+            "ADMIN_NOTIFY_BLOCKED | user=%s | AISENSY_API_KEY not set",
+            user_phone,
+        )
         return False
 
     # Build the admin notification message
-    timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
     reason_line = f"\n*Reason:* {reason}" if reason else ""
     admin_message = (
         "\U0001f6a8 *New Lead Request*\n\n"
@@ -291,37 +362,13 @@ async def notify_admin(
         "Please contact this student."
     )
 
-    # Ensure admin phone has '+' prefix
-    destination = admin_phone if admin_phone.startswith("+") else f"+{admin_phone}"
-
-    url = "https://backend.aisensy.com/campaign/t1/api/v2"
-    payload = {
-        "apiKey": s.AISENSY_API_KEY,
-        "campaignName": s.AISENSY_CAMPAIGN_NAME,
-        "destination": destination,
-        "userName": "Admin",
-        "templateParams": [admin_message],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code in (200, 201):
-                _set_cooldown(user_phone)
-                logger.info(
-                    "ESCALATION_TRIGGERED | user=%s | reason=%s | admin_notified=True",
-                    user_phone, reason or lead_type,
-                )
-                return True
-            else:
-                logger.error(
-                    "AiSensy admin notification failed (%d): %s",
-                    resp.status_code, resp.text,
-                )
-                return False
-    except Exception as e:
-        logger.error("Failed to send admin notification: %s", e)
-        return False
+    sent = await _deliver_admin_message(
+        admin_phone, admin_message,
+        context=f"escalation user={user_phone} reason={reason or lead_type}",
+    )
+    if sent:
+        _set_cooldown(user_phone)
+    return sent
 
 
 # =====================================================================
