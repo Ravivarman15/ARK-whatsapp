@@ -91,6 +91,7 @@ def classify_lead(message: str) -> LeadType:
 # =====================================================================
 
 HOT_LEAD_PHRASES = [
+    # ── English ────────────────────────────────────────────────
     "fees negotiation", "fee negotiation",
     "negotiate fees", "reduce fees", "discount",
     "call me now", "call me back", "callback",
@@ -103,9 +104,17 @@ HOT_LEAD_PHRASES = [
     "scholarship", "pay fees",
     "admission open", "last date",
     "confirm admission",
+    # ── Thanglish (Tamil in English script) ────────────────────
+    "join panna", "join pannanum", "join pannanumnu",
+    "chernu", "chernanum", "serum",
+    "admission venum", "admission aagumu",
+    "padikka vendum", "padikka venum",
+    "fees evlo", "fees enna", "fees yavalo",
+    "enroll panna", "enroll pannanum",
 ]
 
 HOT_LEAD_PATTERNS = [
+    # ── English ────────────────────────────────────────────────
     r"\bcall\s+me\s+now\b",
     r"\bfees?\s+(negotiat|reduc|discount|concess)",
     r"\bhow\s+to\s+join\b",
@@ -113,6 +122,15 @@ HOT_LEAD_PATTERNS = [
     r"\bsend\s+(fee|fees|price)\b",
     r"\badmission\s+(open|start|last|confirm)",
     r"\bbook\s+(a\s+)?seat\b",
+    # ── Thanglish ──────────────────────────────────────────────
+    # "NEET-la join pannanum", "course-la chernanum", etc.
+    r"\b(neet|jee|course|class|batch|coaching)\s*(la|le)?\s*(join|chern|enroll|padi)",
+    # "join pannanum", "chernanum", "padikanum"
+    r"\b(join|chern|padi|enroll)\s*(pann|an)",
+    # "admission venum / aagum", "seat venum"
+    r"\b(admission|seat|fees?)\s+(venum|aagum|iruku)",
+    # "fees evlo / enna / yavalo"
+    r"\bfees?\s+(evlo|enna|yavalo|eppadi)",
 ]
 
 

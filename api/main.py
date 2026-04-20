@@ -519,10 +519,16 @@ async def _process_incoming_message(payload: dict) -> None:
         # "call me now"). This must NOT block the user reply, so run it
         # in the background. We still let the normal route continue so
         # the user gets a proper conversational response.
+        # Admission intent itself is a hot signal — covers Thanglish/Tamil
+        # variants that detect_hot_lead() (phrase-based) can't enumerate.
+        # Only treat it as hot when starting a NEW qualification, so we
+        # don't re-ping admin for every mid-flow reply.
+        is_admission_new = route == Route.ADMISSION_INTENT and not in_qual
+
         if (
             not has_complaint
             and not has_human_req
-            and detect_hot_lead(message)
+            and (detect_hot_lead(message) or is_admission_new)
         ):
             lead_type_hot = classify_lead(message).value
             add_internal_flag(user_id, "HOT_LEAD")
