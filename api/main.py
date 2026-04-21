@@ -315,16 +315,16 @@ async def health():
 @app.post("/admin/test")
 async def admin_test():
     """
-    Diagnostic — fire a synthetic hot-lead admin notification so you
-    can verify ADMIN_WHATSAPP_NUMBER, AiSensy credentials, and the
-    session/template delivery chain without having to simulate a real
-    user message.
+    Diagnostic — fire a synthetic admin alert via the AiSensy Campaign
+    API + approved UTILITY template path, so you can verify
+    ADMIN_WHATSAPP_NUMBER, AISENSY_CAMPAIGN_API_KEY, and
+    AISENSY_CAMPAIGN_NAME without having to simulate a real user message.
 
-    Returns the delivery result + reason if it failed so misconfig is
+    Returns the delivery result + the config surface so misconfig is
     visible in the response (not just in logs).
     """
     from rag.escalation import _is_valid_admin_phone
-    from rag.lead_manager import notify_admin_hot_lead
+    from rag.whatsapp_sender import send_admin_alert
 
     s = get_settings()
     ok, reason = _is_valid_admin_phone(s.ADMIN_WHATSAPP_NUMBER)
@@ -335,24 +335,28 @@ async def admin_test():
             "reason": reason,
         }
 
-    delivered = await notify_admin_hot_lead(
-        user_phone="919000000000",
-        user_message="[diagnostic test from /admin/test]",
-        lead_type="Diagnostic",
+    delivered = await send_admin_alert(
+        phone=s.ADMIN_WHATSAPP_NUMBER,
+        message=(
+            "Diagnostic admin alert from /admin/test — if you see this "
+            "in WhatsApp, the Campaign API + UTILITY template path is "
+            "working."
+        ),
     )
     return {
         "sent": delivered,
         "admin_phone_valid": True,
         "admin_phone_masked": s.ADMIN_WHATSAPP_NUMBER[:4] + "****" + s.ADMIN_WHATSAPP_NUMBER[-3:],
-        "aisensy_api_key_set": bool(s.AISENSY_API_KEY),
         "aisensy_campaign_api_key_set": bool(s.AISENSY_CAMPAIGN_API_KEY),
-        "aisensy_project_id_set": bool(s.AISENSY_PROJECT_ID),
         "aisensy_campaign_name": s.AISENSY_CAMPAIGN_NAME or None,
+        "aisensy_api_key_set": bool(s.AISENSY_API_KEY),
+        "aisensy_project_id_set": bool(s.AISENSY_PROJECT_ID),
         "note": (
-            "If sent=false and aisensy_campaign_api_key_set=false, you're using "
-            "the Project API password against the Campaign API — grab the JWT "
-            "from AiSensy dashboard → Manage → API Keys and set "
-            "AISENSY_CAMPAIGN_API_KEY. Check logs for ADMIN_CAMPAIGN_FAIL body."
+            "If sent=false, check logs for ADMIN_ALERT_FAIL_PERMANENT "
+            "(likely: wrong campaign name, revoked JWT, or underlying "
+            "template got reclassified to MARKETING). AISENSY_API_KEY / "
+            "AISENSY_PROJECT_ID are shown because they're used by the "
+            "session-text fallback inside the 24h window."
         ),
     }
 
@@ -623,8 +627,15 @@ async def _process_incoming_message(payload: dict) -> None:
         # PRIORITY 3: Factual Question → RAG only, NO follow-up
         # =============================================================
         if route == Route.FACTUAL_QUESTION:
-            # If user is mid-qualification and asks a question,
-            # answer the question then re-prompt the current step
+            # If user is mid-qualification and asks a factual question,
+            # answer ONLY — do not re-prompt the qual step. The user has
+            # clearly switched gears; pushing "What's the student's name?"
+            # back at them after they asked "Tell me about ARK" is a
+            # jarring UX. The qual state is preserved in `_active_leads`
+            # and will auto-resume the moment the user sends something
+            # that looks like a field answer or another admission signal
+            # (Route.QUALIFICATION / Route.ADMISSION_INTENT handle that).
+            # If they never come back, the flow times out after 30 min.
             if in_qual:
                 try:
                     rag_answer = await ask_async(question=message, user_id=user_id)
@@ -632,13 +643,12 @@ async def _process_incoming_message(payload: dict) -> None:
                 except Exception as rag_err:
                     logger.exception("RAG_ERROR (factual_midflow) | %s: %s", type(rag_err).__name__, rag_err)
                     rag_answer = RAG_ERROR_MESSAGE
-                current_prompt = get_current_qual_prompt(user_id)
-                # Send answer and re-prompt as separate messages for clarity
                 if phone:
                     await send_whatsapp_message(phone, rag_answer)
-                    await send_whatsapp_message(phone, current_prompt)
-                reply = rag_answer
-                logger.info("AI_RESPONSE | phone=%s | type=factual_midflow | response=\"%s\"", phone, reply[:120])
+                logger.info(
+                    "AI_RESPONSE | phone=%s | type=factual_midflow | response=\"%s\"",
+                    phone, rag_answer[:120],
+                )
                 return
 
             # Pure factual question — answer only, no qualification trigger

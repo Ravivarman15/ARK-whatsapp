@@ -49,10 +49,11 @@ class Settings(BaseSettings):
     #                             → used by Campaign template sends
     #                               (backend.aisensy.com/campaign/…)
     # Copy the Campaign API Key from AiSensy dashboard → Manage → API Keys.
-    AISENSY_API_KEY: str = ""                  # Project API password
-    AISENSY_CAMPAIGN_API_KEY: str = ""         # Campaign API JWT (for admin alerts / follow-ups)
-    AISENSY_PROJECT_ID: str = ""               # AiSensy project ID (for session replies)
-    AISENSY_CAMPAIGN_NAME: str = ""            # Campaign name for template messages (follow-ups / admin alerts)
+    AISENSY_API_KEY: str = ""                  # Project API password — for session text replies to users
+    AISENSY_CAMPAIGN_API_KEY: str = ""         # Campaign API JWT (eyJ…) — for admin alert templates
+    AISENSY_PROJECT_ID: str = ""               # AiSensy project ID (for Project API session replies)
+    AISENSY_CAMPAIGN_NAME: str = ""            # Campaign name (not template name) wrapping the approved
+                                               # UTILITY admin-alert template, e.g. "admin_alerts".
 
     # ── Admin / Escalation ────────────────────────────────────────
     ADMIN_WHATSAPP_NUMBER: str = ""       # Admin phone for lead alerts
