@@ -257,7 +257,7 @@ async def _deliver_admin_message(
 ) -> bool:
     """
     Deliver a message to the admin via the AiSensy Project Messages API
-    using a pre-approved UTILITY template (``admin_alert`` by default).
+    using a pre-approved UTILITY template (``admin_alerts`` by default).
 
     Previously this routed through the Campaign API, which produced
     high dashboard failure rates on 1:1 transactional alerts. All admin

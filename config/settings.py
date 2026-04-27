@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # for admin alerts via the Project Messages API. Must match exactly
     # (case-sensitive) a template in AiSensy → Templates whose body
     # contains exactly ONE variable ({{1}}) and whose category is UTILITY.
-    AISENSY_ADMIN_ALERT_TEMPLATE: str = "admin_alert"
+    AISENSY_ADMIN_ALERT_TEMPLATE: str = "admin_alerts"
 
     # ── Admin / Escalation ────────────────────────────────────────
     ADMIN_WHATSAPP_NUMBER: str = ""       # Admin phone for lead alerts
