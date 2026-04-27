@@ -49,6 +49,7 @@ from rag.lead_manager import (
     store_lead_data,
     process_qualification_message,
     get_current_qual_prompt,
+    get_soft_reprompt,
     complete_lead,
     get_lead_data,
     save_lead_to_db,
@@ -439,10 +440,11 @@ async def _process_incoming_message(payload: dict) -> None:
       1. Complaint / escalation     → escalate immediately
       2. Human escalation request   → connect to counsellor
       3. Hot lead (admission-ready) → instant admin alert + qualification
-      4. Factual question (RAG)     → answer ONLY, no follow-up
-      5. Admission intent           → start/resume qualification flow
-      6. Active qualification flow  → continue collecting data
-      7. General fallback           → short RAG answer
+      4. Multi-intent (Q + verb)    → answer via RAG, then start qual
+      5. Factual question (RAG)     → answer; if mid-qual, soft re-prompt
+      6. Admission intent           → start/resume qualification flow
+      7. Active qualification flow  → continue collecting data
+      8. General fallback           → short RAG answer
     """
     phone = ""  # Pre-init so fallback in except block can reference it
     try:
@@ -624,18 +626,45 @@ async def _process_incoming_message(payload: dict) -> None:
             return
 
         # =============================================================
-        # PRIORITY 3: Factual Question → RAG only, NO follow-up
+        # PRIORITY 3: Multi-Intent → answer via RAG, then start qual
+        # =============================================================
+        # User mixed a question with an explicit admission verb, e.g.
+        # "I want to join NEET, what are fees?". Answer first so they
+        # don't feel ignored, then start (or resume) the qualification
+        # flow. start_lead_qualification handles the resume case so we
+        # don't re-ask fields the user already provided.
+        if route == Route.MULTI_INTENT:
+            try:
+                rag_answer = await ask_async(question=message, user_id=user_id)
+                rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
+            except Exception as rag_err:
+                logger.exception("RAG_ERROR (multi_intent) | %s: %s", type(rag_err).__name__, rag_err)
+                rag_answer = RAG_ERROR_MESSAGE
+
+            course = detect_course_interest(message)
+            update_score(user_id, ScoreAction.ASKED_ADMISSION)
+            qual_prompt = start_lead_qualification(
+                user_id=user_id, phone=phone, course=course or "",
+            )
+            if phone:
+                await send_whatsapp_message(phone, rag_answer)
+                await send_whatsapp_message(phone, qual_prompt)
+            logger.info(
+                "AI_RESPONSE | phone=%s | type=multi_intent | answer=\"%s\" | qual=\"%s\"",
+                phone, rag_answer[:80], qual_prompt[:80],
+            )
+            return
+
+        # =============================================================
+        # PRIORITY 4: Factual Question → RAG; if mid-qual, soft re-prompt
         # =============================================================
         if route == Route.FACTUAL_QUESTION:
-            # If user is mid-qualification and asks a factual question,
-            # answer ONLY — do not re-prompt the qual step. The user has
-            # clearly switched gears; pushing "What's the student's name?"
-            # back at them after they asked "Tell me about ARK" is a
-            # jarring UX. The qual state is preserved in `_active_leads`
-            # and will auto-resume the moment the user sends something
-            # that looks like a field answer or another admission signal
-            # (Route.QUALIFICATION / Route.ADMISSION_INTENT handle that).
-            # If they never come back, the flow times out after 30 min.
+            # Mid-qualification: answer the question, then politely
+            # nudge back to the pending field with a soft "Also, can
+            # I get…" re-prompt. The qual state is preserved in
+            # `_active_leads` and the user can complete the flow
+            # without restarting from name. Pure (non-qual) factual
+            # questions get the answer alone — no qualification trigger.
             if in_qual:
                 try:
                     rag_answer = await ask_async(question=message, user_id=user_id)
@@ -643,11 +672,14 @@ async def _process_incoming_message(payload: dict) -> None:
                 except Exception as rag_err:
                     logger.exception("RAG_ERROR (factual_midflow) | %s: %s", type(rag_err).__name__, rag_err)
                     rag_answer = RAG_ERROR_MESSAGE
+                soft_prompt = get_soft_reprompt(user_id)
                 if phone:
                     await send_whatsapp_message(phone, rag_answer)
+                    if soft_prompt:
+                        await send_whatsapp_message(phone, soft_prompt)
                 logger.info(
-                    "AI_RESPONSE | phone=%s | type=factual_midflow | response=\"%s\"",
-                    phone, rag_answer[:120],
+                    "AI_RESPONSE | phone=%s | type=factual_midflow | answer=\"%s\" | soft=\"%s\"",
+                    phone, rag_answer[:80], soft_prompt[:80],
                 )
                 return
 
@@ -681,7 +713,7 @@ async def _process_incoming_message(payload: dict) -> None:
             return
 
         # =============================================================
-        # PRIORITY 4: Admission Intent → start/resume qualification
+        # PRIORITY 5: Admission Intent → start/resume qualification
         # =============================================================
         if route == Route.ADMISSION_INTENT:
             course = detect_course_interest(message)
@@ -704,23 +736,27 @@ async def _process_incoming_message(payload: dict) -> None:
             return
 
         # =============================================================
-        # PRIORITY 5: Active Qualification Flow
+        # PRIORITY 6: Active Qualification Flow
         # =============================================================
         if route == Route.QUALIFICATION:
             result = process_qualification_message(user_id, message)
 
             if result is None:
-                # User asked a question mid-flow — answer via RAG + re-prompt
+                # User asked a question mid-flow — answer via RAG, then
+                # send a soft "Also, can I get…" re-prompt instead of
+                # the terse default prompt. Falls back to the default
+                # prompt if the soft variant isn't defined for this step.
                 try:
                     rag_answer = await ask_async(question=message, user_id=user_id)
                     rag_answer = format_whatsapp_response(rag_answer, is_factual=True)
                 except Exception as rag_err:
                     logger.exception("RAG_ERROR (qual_midflow) | %s: %s", type(rag_err).__name__, rag_err)
                     rag_answer = RAG_ERROR_MESSAGE
-                current_prompt = get_current_qual_prompt(user_id)
+                follow_prompt = get_soft_reprompt(user_id) or get_current_qual_prompt(user_id)
                 if phone:
                     await send_whatsapp_message(phone, rag_answer)
-                    await send_whatsapp_message(phone, current_prompt)
+                    if follow_prompt:
+                        await send_whatsapp_message(phone, follow_prompt)
                 reply = rag_answer
             else:
                 reply = result
@@ -744,7 +780,7 @@ async def _process_incoming_message(payload: dict) -> None:
             return
 
         # =============================================================
-        # PRIORITY 6: General Fallback → short RAG answer
+        # PRIORITY 7: General Fallback → short RAG answer
         # =============================================================
         try:
             answer = await ask_async(question=message, user_id=user_id)

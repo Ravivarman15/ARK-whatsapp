@@ -459,6 +459,31 @@ def get_current_qual_prompt(user_id: str) -> str:
     return QUAL_PROMPTS.get(lead.current_step, "")
 
 
+# Soft re-prompts — prefix with "Also, " so a mid-flow answered question
+# transitions naturally back to the pending field instead of feeling
+# like the bot ignored what the user just asked.
+_SOFT_REPROMPTS = {
+    QualStep.ASK_NAME: "Also, can I get the student's name to help you further?",
+    QualStep.ASK_CLASS: "Also, which class is the student in?",
+    QualStep.ASK_SCHOOL: "Also, which school does the student study in?",
+    QualStep.ASK_PARENT_PHONE: "Also, please share a contact number so our counsellor can call.",
+}
+
+
+def get_soft_reprompt(user_id: str) -> str:
+    """
+    Return a "Also, can I get…"-style re-prompt for the user's current
+    qualification step. Used after the bot has answered a mid-flow
+    question and wants to gently steer back to the pending field.
+
+    Returns "" if the user has no active qualification.
+    """
+    lead = _active_leads.get(user_id)
+    if lead is None:
+        return ""
+    return _SOFT_REPROMPTS.get(lead.current_step, "")
+
+
 def complete_lead(user_id: str) -> Optional[LeadData]:
     """
     Complete and return the lead data, then remove from active store.

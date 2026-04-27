@@ -37,9 +37,16 @@ QUESTION_STARTERS = [
 QUESTION_PATTERNS = [
     r"\?",                           # Contains question mark
     r"^(what|how|why|when|where|who|which|is|are|can|do|does|will)\b",
-    r"^(tell\s+me|explain|describe)\b",
+    r"^(tell\s+me|explain|describe|show\s+me)\b",
     r"^(kya|kaise|kab|kahan|kaun|kitna|konsa|bata)\b",
     r"\b(fees?|cost|price|batch|timing|schedule|syllabus|result)\b.*\?",
+    # Declarative-form questions ("I'm asking fees", "want to know")
+    r"\b(i'?m|i\s+am)\s+asking\b",
+    r"\b(want|need|wanted)\s+to\s+know\b",
+    r"^asking\b",
+    # Topic words alone (e.g. user types just "fees" mid-flow) — these
+    # are not field answers; route to RAG so the user gets an answer.
+    r"^(fees?|course|courses|batch|batches|timing|timings|schedule|demo|syllabus)$",
 ]
 
 # Command words
@@ -94,26 +101,34 @@ def validate_name(message: str) -> tuple[bool, str]:
 
     Rules:
       - 2–50 characters
-      - Alphabetic + spaces + dots only
+      - No digits anywhere (real names don't contain numbers)
       - No question marks
-      - No question words at the start
-      - Not purely numeric
+      - No more than 4 words (real names rarely exceed this; longer
+        inputs are sentences/questions, not names)
+      - First word must not be a question/imperative word (what, how,
+        tell, show, explain, etc.)
+      - Not purely numeric, not purely punctuation
+      - Alphabetic + spaces + dots/hyphens only after cleaning
 
     Returns:
         (is_valid, cleaned_value)
     """
     value = message.strip()
 
-    # Reject empty or too short
     if len(value) < 2:
         return False, value
 
-    # Reject question marks
+    # Reject question marks anywhere
     if "?" in value:
         return False, value
 
-    # Reject purely numeric
-    if value.replace(" ", "").isdigit():
+    # Reject if any digit is present — real names don't have numbers.
+    # Catches "fees 2024", "class 10", "9876543210", etc.
+    if any(c.isdigit() for c in value):
+        return False, value
+
+    # Reject sentence-shaped input — names are rarely > 4 words.
+    if len(value.split()) > 4:
         return False, value
 
     # Allow only letters, spaces, dots, and hyphens
@@ -121,19 +136,22 @@ def validate_name(message: str) -> tuple[bool, str]:
     if len(cleaned) < 2:
         return False, value
 
-    # Reject if it starts with a question word
+    # Reject if it starts with a question/imperative word. Apply this
+    # whenever there's at least one trailing word — "what name" or
+    # "tell name" is clearly not a name.
     first_word = cleaned.lower().split()[0] if cleaned.split() else ""
-    question_words = {"what", "how", "why", "when", "where", "who", "which",
-                      "is", "are", "can", "do", "does", "will", "tell",
-                      "kya", "kaise", "kab", "kahan", "kaun"}
-    if first_word in question_words and len(cleaned.split()) > 2:
+    question_words = {
+        "what", "how", "why", "when", "where", "who", "which",
+        "is", "are", "can", "do", "does", "will", "would", "should",
+        "tell", "show", "explain", "describe", "give",
+        "kya", "kaise", "kab", "kahan", "kaun",
+    }
+    if first_word in question_words and len(cleaned.split()) >= 2:
         return False, value
 
-    # Truncate to 50 chars
     if len(cleaned) > 50:
         cleaned = cleaned[:50].strip()
 
-    # Title-case the name
     cleaned = cleaned.title()
 
     return True, cleaned

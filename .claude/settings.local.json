@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -c 'import ast, os, sys *)",
       "Bash(python -c ' *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(xargs wc *)"
     ]
   }
 }
