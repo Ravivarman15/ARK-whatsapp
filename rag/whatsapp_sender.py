@@ -19,13 +19,30 @@ and rag/followup_manager.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+from typing import NamedTuple
 
 import httpx
 
 from config.settings import get_settings
 
 logger = logging.getLogger("ark.sender")
+
+
+class AdminAlertResult(NamedTuple):
+    """Structured result of an admin-alert send attempt.
+
+    ``ok``     — True if the message was delivered (template or fallback).
+    ``status`` — Last HTTP status code seen, or None if no request went out.
+    ``via``    — "template" | "text_fallback" | "blocked" | "dropped".
+    ``error``  — Human-readable reason for failure; empty on success.
+    """
+    ok: bool
+    status: int | None
+    via: str
+    error: str
 
 MAX_SEND_RETRIES = 1
 FALLBACK_MESSAGE = "Sorry, I'm having trouble right now. Please try again in a moment."
@@ -105,7 +122,7 @@ async def send_whatsapp_message(phone: str, message: str) -> bool:
 
 
 # =====================================================================
-# Admin alerts — AiSensy Campaign API + approved UTILITY template
+# Admin alerts — AiSensy Project Messages API + approved UTILITY template
 # =====================================================================
 
 def _normalize_admin_phone(phone: str) -> str | None:
@@ -124,144 +141,219 @@ def _normalize_admin_phone(phone: str) -> str | None:
     return digits
 
 
-async def send_admin_alert(phone: str, message: str) -> bool:
+# WhatsApp Cloud API template-parameter rules (enforced by Meta, surfaced
+# by AiSensy as "Invalid Parameter"):
+#   1. No newline characters  (\r, \n)
+#   2. No tab characters      (\t)
+#   3. No more than 4 consecutive spaces
+# Applying these in order fixes the vast majority of Invalid-Parameter
+# failures on multi-line admin summaries.
+_MULTI_SPACE_RE = re.compile(r" {5,}")
+
+
+def _sanitize_template_param(value: object) -> str:
     """
-    Deliver a WhatsApp admin alert via the AiSensy Campaign API using a
-    pre-approved UTILITY template wrapped in a campaign.
+    Coerce any input into a WhatsApp-safe template-parameter string.
 
-    Credentials
-    -----------
-    * ``AISENSY_CAMPAIGN_API_KEY`` — JWT (``eyJ...``), copied from
-      AiSensy → Manage → API Keys. Passed as ``apiKey`` in the body.
-    * ``AISENSY_CAMPAIGN_NAME`` — the **campaign name** in AiSensy that
-      wraps the approved UTILITY template (e.g. ``admin_alerts``). This
-      is NOT the raw template name.
+    Rules applied (in order):
+      - Non-strings are coerced via ``str()``
+      - ``\\r`` stripped, ``\\n`` → " | " (preserves structure on one line)
+      - ``\\t`` → single space
+      - Runs of 5+ spaces collapsed to 4
+      - Leading/trailing whitespace stripped
+      - Empty result replaced with sentinel "New Alert" so the param is
+        never an empty string (Meta rejects empty values too)
 
-    Payload shape matches the exact curl AiSensy's dashboard generates
-    for the campaign — including the empty ``media/buttons/carouselCards/
-    location/attributes`` objects and the ``paramsFallbackValue`` map,
-    which AiSensy expects even when unused.
+    Returns:
+        A single-line string safe to send as ``{{1}}``.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+
+    # Normalise line endings, then flatten newlines to a separator that
+    # preserves the visual break without tripping Meta's \n rule.
+    value = value.replace("\r\n", "\n").replace("\r", "")
+    value = value.replace("\n", " | ")
+
+    # Tabs are disallowed; a single space is the closest equivalent.
+    value = value.replace("\t", " ")
+
+    # Collapse long space runs so "4+ consecutive spaces" can never happen.
+    value = _MULTI_SPACE_RE.sub("    ", value)
+
+    value = value.strip()
+    if not value:
+        value = "New Alert"
+
+    if len(value) > ADMIN_ALERT_BODY_LIMIT:
+        value = value[: ADMIN_ALERT_BODY_LIMIT - 1] + "…"
+
+    return value
+
+
+async def send_admin_alert(phone: str, message: object) -> AdminAlertResult:
+    """
+    Deliver a WhatsApp admin alert via the AiSensy Project Messages API
+    using a pre-approved UTILITY template (name from
+    ``AISENSY_ADMIN_ALERT_TEMPLATE``, default ``admin_alert``).
+
+    Why this shape
+    --------------
+    AiSensy's "Invalid Parameter" dashboard error on Project-API template
+    sends is almost always Meta's template-parameter validator rejecting
+    newlines, tabs, or runs of 5+ spaces inside the ``{{1}}`` value.
+    ``_sanitize_template_param`` strips all three before we serialise.
+
+    Payload — matches the user-specified shape exactly, no extra fields::
+
+        {
+          "to": "91XXXXXXXXXX",
+          "type": "template",
+          "recipient_type": "individual",
+          "template": {
+            "name": "<AISENSY_ADMIN_ALERT_TEMPLATE>",
+            "language": {"code": "en"},
+            "components": [
+              {"type": "body", "parameters": [{"type": "text", "text": "<msg>"}]}
+            ]
+          }
+        }
 
     Delivery strategy
     -----------------
-    1. POST the campaign template message. Approved UTILITY templates
-       are the only payload WhatsApp accepts outside the 24h customer-
-       care window, so this is the reliable path for admin alerts.
-    2. Retry up to ``ADMIN_ALERT_MAX_RETRIES`` times on transient
-       failures (network errors + 408/429/5xx). 4xx responses (bad
-       campaign, bad phone, auth) are permanent and fail fast.
-    3. If the template send fully fails, attempt a plain-text session
-       send as a best-effort fallback. That only lands if the admin
-       messaged the bot within the last 24h — outside that window
-       WhatsApp rejects it, which we log loudly rather than surface
-       as a bot-wide error.
+    1. Template send via ``apis.aisensy.com/project-apis/v1/project/<id>/messages``
+       authed with ``X-AiSensy-Project-API-Pwd: <AISENSY_API_KEY>``.
+    2. Retry up to ``ADMIN_ALERT_MAX_RETRIES`` on transient failures
+       (408/429/5xx + network errors). 4xx fails fast — that means the
+       parameter or template is wrong; no amount of retrying helps.
+    3. If the template fully fails and the admin is inside the 24h
+       customer-care window, fall back to a plain-text session send.
 
     Args:
-        phone:   Admin phone in ``91XXXXXXXXXX`` form; a leading ``+``
-                 is stripped. Non-digit / short numbers are rejected.
-        message: Plain-text body. Becomes the single ``{{1}}`` template
-                 parameter. Truncated to ``ADMIN_ALERT_BODY_LIMIT`` chars
-                 to stay inside WhatsApp's body-variable size cap.
+        phone:   Admin phone in ``91XXXXXXXXXX`` form (a leading ``+`` is stripped).
+        message: Any value; non-strings are coerced, newlines flattened,
+                 empty strings replaced with "New Alert".
 
     Returns:
-        True if the template OR the text fallback delivered successfully.
+        AdminAlertResult(ok, status, via, error). Existing bool-expecting
+        callers can still do ``if result:`` — NamedTuple is falsy only
+        when all fields are zero, so we never accidentally lie; callers
+        that want correctness should check ``.ok``.
     """
     s = get_settings()
 
-    if not s.AISENSY_CAMPAIGN_API_KEY:
-        logger.error("ADMIN_ALERT_BLOCKED | reason=AISENSY_CAMPAIGN_API_KEY not set")
-        return False
-    if not s.AISENSY_CAMPAIGN_NAME:
-        logger.error("ADMIN_ALERT_BLOCKED | reason=AISENSY_CAMPAIGN_NAME not set")
-        return False
+    # ── 1. Safe-guard: coerce + sanitize the message ─────────────
+    body_param = _sanitize_template_param(message)
+
+    # ── 2. Validate credentials + phone ──────────────────────────
+    if not s.AISENSY_API_KEY or not s.AISENSY_PROJECT_ID:
+        err = "AISENSY_API_KEY or AISENSY_PROJECT_ID not set"
+        logger.error("ADMIN_ALERT_BLOCKED | reason=%s", err)
+        return AdminAlertResult(False, None, "blocked", err)
 
     destination = _normalize_admin_phone(phone)
     if destination is None:
-        logger.error(
-            "ADMIN_ALERT_BLOCKED | reason=invalid phone (expected 91XXXXXXXXXX) | raw=%r",
-            phone,
-        )
-        return False
+        err = f"invalid phone (expected 91XXXXXXXXXX): {phone!r}"
+        logger.error("ADMIN_ALERT_BLOCKED | reason=%s", err)
+        return AdminAlertResult(False, None, "blocked", err)
 
-    body_param = (message or "").strip()
-    if not body_param:
-        logger.error("ADMIN_ALERT_BLOCKED | reason=empty message body")
-        return False
-    if len(body_param) > ADMIN_ALERT_BODY_LIMIT:
-        body_param = body_param[: ADMIN_ALERT_BODY_LIMIT - 1] + "…"
+    template_name = (s.AISENSY_ADMIN_ALERT_TEMPLATE or "admin_alert").strip()
+    if not template_name:
+        err = "AISENSY_ADMIN_ALERT_TEMPLATE is empty"
+        logger.error("ADMIN_ALERT_BLOCKED | reason=%s", err)
+        return AdminAlertResult(False, None, "blocked", err)
 
-    url = "https://backend.aisensy.com/campaign/t1/api/v2"
+    # ── 3. Build EXACT payload shape — no extra fields ───────────
+    url = (
+        f"https://apis.aisensy.com/project-apis/v1/"
+        f"project/{s.AISENSY_PROJECT_ID}/messages"
+    )
+    headers = {
+        "X-AiSensy-Project-API-Pwd": s.AISENSY_API_KEY,
+        "Content-Type": "application/json",
+    }
     payload = {
-        "apiKey": s.AISENSY_CAMPAIGN_API_KEY,
-        "campaignName": s.AISENSY_CAMPAIGN_NAME,
-        "destination": destination,
-        "userName": "ARK LEARNING ARENA",
-        "templateParams": [body_param],
-        "source": "ark-ai-bot",
-        "media": {},
-        "buttons": [],
-        "carouselCards": [],
-        "location": {},
-        "attributes": {},
-        "paramsFallbackValue": {"FirstName": "Admin"},
+        "to": destination,
+        "type": "template",
+        "recipient_type": "individual",
+        "template": {
+            "name": template_name,
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": body_param},
+                    ],
+                },
+            ],
+        },
     }
 
+    # ── 4. Debug log: final message, type, full payload ─────────
     masked_to = destination[:4] + "****" + destination[-3:]
     logger.info(
-        "ADMIN_ALERT_SEND | to=%s | campaign=%s | param_len=%d",
-        masked_to, s.AISENSY_CAMPAIGN_NAME, len(body_param),
+        "ADMIN_ALERT_SEND | to=%s | template=%s | msg_type=%s | msg_len=%d | msg=%r",
+        masked_to, template_name, type(message).__name__, len(body_param), body_param,
+    )
+    logger.debug(
+        "ADMIN_ALERT_PAYLOAD | to=%s | payload=%s",
+        masked_to, json.dumps(payload, ensure_ascii=False),
     )
 
     last_status: int | None = None
     last_body: str = ""
+    last_error: str = ""
     total_attempts = ADMIN_ALERT_MAX_RETRIES + 1
 
     for attempt in range(1, total_attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, headers=headers, json=payload)
             last_status = resp.status_code
             last_body = resp.text[:500]
 
             if resp.status_code in (200, 201, 202):
                 logger.info(
-                    "ADMIN_ALERT_OK | to=%s | attempt=%d | status=%d",
-                    masked_to, attempt, resp.status_code,
+                    "ADMIN_ALERT_OK | to=%s | attempt=%d | status=%d | response=%s",
+                    masked_to, attempt, resp.status_code, last_body,
                 )
-                return True
+                return AdminAlertResult(True, resp.status_code, "template", "")
+
+            last_error = _extract_aisensy_error(last_body, resp.status_code)
 
             if resp.status_code not in _RETRYABLE_STATUSES:
                 logger.error(
-                    "ADMIN_ALERT_FAIL_PERMANENT | to=%s | attempt=%d | status=%d | body=%s",
-                    masked_to, attempt, resp.status_code, last_body,
+                    "ADMIN_ALERT_FAIL_PERMANENT | to=%s | attempt=%d | status=%d | error=%s | body=%s",
+                    masked_to, attempt, resp.status_code, last_error, last_body,
                 )
                 break
 
             logger.warning(
-                "ADMIN_ALERT_RETRY | to=%s | attempt=%d/%d | status=%d | body=%s",
-                masked_to, attempt, total_attempts, resp.status_code, last_body,
+                "ADMIN_ALERT_RETRY | to=%s | attempt=%d/%d | status=%d | error=%s | body=%s",
+                masked_to, attempt, total_attempts, resp.status_code, last_error, last_body,
             )
         except httpx.HTTPError as e:
+            last_error = f"{type(e).__name__}: {e}"
             logger.warning(
-                "ADMIN_ALERT_RETRY | to=%s | attempt=%d/%d | error=%s: %s",
-                masked_to, attempt, total_attempts, type(e).__name__, e,
+                "ADMIN_ALERT_RETRY | to=%s | attempt=%d/%d | error=%s",
+                masked_to, attempt, total_attempts, last_error,
             )
         except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
             logger.exception(
-                "ADMIN_ALERT_ERROR | to=%s | attempt=%d | %s", masked_to, attempt, e
+                "ADMIN_ALERT_ERROR | to=%s | attempt=%d | %s",
+                masked_to, attempt, last_error,
             )
             break
 
         if attempt < total_attempts:
             await asyncio.sleep(ADMIN_ALERT_RETRY_DELAY)
 
-    # ── Safe fallback: session text send ──────────────────────────
-    # Only delivers if the admin is inside the 24h customer-care window;
-    # WhatsApp rejects it otherwise. Worth attempting so that an active-
-    # session admin still gets the alert if the campaign config broke.
+    # ── 5. Safe fallback: session text (only works inside 24h) ───
     logger.warning(
-        "ADMIN_ALERT_FALLBACK_TEXT | to=%s | campaign_last_status=%s | campaign_body=%s",
-        masked_to, last_status, last_body,
+        "ADMIN_ALERT_FALLBACK_TEXT | to=%s | template_last_status=%s | error=%s",
+        masked_to, last_status, last_error,
     )
     fallback_ok = await send_whatsapp_message(destination, body_param)
     if fallback_ok:
@@ -269,13 +361,45 @@ async def send_admin_alert(phone: str, message: str) -> bool:
             "ADMIN_ALERT_FALLBACK_OK | to=%s | delivered via session text",
             masked_to,
         )
-        return True
+        return AdminAlertResult(True, last_status, "text_fallback", last_error)
 
     logger.error(
-        "ADMIN_ALERT_DROPPED | to=%s | campaign + text fallback both failed "
-        "(if admin is outside 24h window, only approved templates will land — "
-        "verify AISENSY_CAMPAIGN_NAME points to a live campaign wrapping an "
-        "APPROVED UTILITY template with exactly one body variable)",
-        masked_to,
+        "ADMIN_ALERT_DROPPED | to=%s | status=%s | error=%s | "
+        "(if admin is outside 24h window, only approved templates land — "
+        "verify AISENSY_ADMIN_ALERT_TEMPLATE is an APPROVED UTILITY template "
+        "with exactly one body variable, and that the message contains no "
+        "newlines/tabs after sanitization)",
+        masked_to, last_status, last_error,
     )
-    return False
+    return AdminAlertResult(False, last_status, "dropped", last_error or "delivery failed")
+
+
+def _extract_aisensy_error(body_text: str, status: int) -> str:
+    """
+    Pull a short, human-readable error string out of an AiSensy / Meta
+    response body. Falls back to the raw status label if no JSON fits.
+
+    AiSensy error shapes we've seen:
+      {"message": "Invalid Parameter", ...}
+      {"error": {"message": "...", "code": 131000}}
+      "<html>…"  (for 5xx / gateway failures — returned as-is, truncated)
+    """
+    if not body_text:
+        return f"HTTP {status}"
+    try:
+        data = json.loads(body_text)
+    except ValueError:
+        return f"HTTP {status} — {body_text[:120]}"
+    if isinstance(data, dict):
+        for key in ("message", "error_message", "errorMessage"):
+            val = data.get(key)
+            if isinstance(val, str) and val:
+                return val
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("description")
+            if isinstance(msg, str) and msg:
+                return msg
+        if isinstance(err, str) and err:
+            return err
+    return f"HTTP {status}"

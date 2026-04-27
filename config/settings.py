@@ -49,11 +49,16 @@ class Settings(BaseSettings):
     #                             → used by Campaign template sends
     #                               (backend.aisensy.com/campaign/…)
     # Copy the Campaign API Key from AiSensy dashboard → Manage → API Keys.
-    AISENSY_API_KEY: str = ""                  # Project API password — for session text replies to users
-    AISENSY_CAMPAIGN_API_KEY: str = ""         # Campaign API JWT (eyJ…) — for admin alert templates
-    AISENSY_PROJECT_ID: str = ""               # AiSensy project ID (for Project API session replies)
-    AISENSY_CAMPAIGN_NAME: str = ""            # Campaign name (not template name) wrapping the approved
-                                               # UTILITY admin-alert template, e.g. "admin_alerts".
+    AISENSY_API_KEY: str = ""                  # Project API password — for session text replies AND admin templates
+    AISENSY_CAMPAIGN_API_KEY: str = ""         # DEPRECATED — Campaign API JWT; kept only for backwards compat
+    AISENSY_PROJECT_ID: str = ""               # AiSensy project ID (Project API)
+    AISENSY_CAMPAIGN_NAME: str = ""            # DEPRECATED — see AISENSY_ADMIN_ALERT_TEMPLATE
+
+    # Name of the pre-approved UTILITY **template** (not campaign) used
+    # for admin alerts via the Project Messages API. Must match exactly
+    # (case-sensitive) a template in AiSensy → Templates whose body
+    # contains exactly ONE variable ({{1}}) and whose category is UTILITY.
+    AISENSY_ADMIN_ALERT_TEMPLATE: str = "admin_alert"
 
     # ── Admin / Escalation ────────────────────────────────────────
     ADMIN_WHATSAPP_NUMBER: str = ""       # Admin phone for lead alerts
