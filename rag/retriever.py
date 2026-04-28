@@ -144,23 +144,32 @@ SYSTEM_INSTRUCTION = (
 # Message Builder
 # =====================================================================
 
+_COMPLETION_RULE = (
+    " Keep the reply to 3–5 short lines, but ALWAYS finish every "
+    "sentence. Never cut off mid-word or mid-thought — if you are "
+    "running long, drop a bullet rather than leaving one unfinished."
+)
+
 _LANG_DIRECTIVE = {
     "english": (
         "\nLANGUAGE LOCK: The user wrote in English. "
         "You MUST reply ONLY in English. "
         "Do NOT use Tamil script (Unicode) or Tamil transliteration words "
         "(evlo, enna, nalla, irukku, vanga, etc.). Pure English only."
+        + _COMPLETION_RULE
     ),
     "thanglish": (
         "\nLANGUAGE LOCK: The user wrote in Thanglish (Tamil words in English letters). "
         "You MUST reply ONLY in Thanglish — Tamil words written in English letters. "
         "Do NOT use Tamil Unicode script. Do NOT reply in pure English. "
         "Example style: \"Vanga! Namma ARK la NEET batch iruku, fees details counsellor share pannuvanga.\""
+        + _COMPLETION_RULE
     ),
     "tamil": (
         "\nLANGUAGE LOCK: The user wrote in Tamil (Unicode script). "
         "You MUST reply ONLY in Tamil Unicode script (தமிழ்). "
         "Do NOT reply in English or Thanglish (romanized Tamil)."
+        + _COMPLETION_RULE
     ),
 }
 
@@ -282,8 +291,9 @@ async def generate_answer_async(
 # =====================================================================
 
 NO_CONTEXT_MSG = (
-    "I'm sorry, I couldn't find relevant information in our knowledge base. "
-    "Please contact ARK Learning Arena directly for assistance."
+    "Could you please share a little more about what you're looking for? \U0001f60a "
+    "I can help with our courses, fees, batches, demo classes, or anything else "
+    "about ARK Learning Arena."
 )
 
 

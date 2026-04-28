@@ -46,6 +46,7 @@ logger = logging.getLogger("ark.router")
 class Route(str, Enum):
     COMPLAINT = "complaint"
     HUMAN_ESCALATION = "human_escalation"
+    SMALL_TALK = "small_talk"
     MULTI_INTENT = "multi_intent"
     FACTUAL_QUESTION = "factual_question"
     ADMISSION_INTENT = "admission_intent"
@@ -232,6 +233,15 @@ def classify_message(
     # ── Priority 2: Human escalation ─────────────────────────────
     if has_human_request:
         return Route.HUMAN_ESCALATION
+
+    # ── Priority 3: Small talk (greeting / ack / thanks / bye) ────
+    # Only when NOT mid-qualification — otherwise an "ok" should be
+    # handled by the qualification state machine, not short-circuited
+    # to a greeting. Local import avoids a circular dependency.
+    if not is_in_qualification:
+        from rag.greeting_handler import detect_small_talk
+        if detect_small_talk(msg):
+            return Route.SMALL_TALK
 
     is_q = _is_question(msg)
     has_verb = _has_admission_verb(msg)

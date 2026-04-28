@@ -84,7 +84,11 @@ class Settings(BaseSettings):
     # ── Performance ───────────────────────────────────────────────
     # Tight budget: we need WhatsApp replies in <2s end-to-end.
     HF_TIMEOUT: int = 15         # Seconds before HuggingFace call is aborted
-    MAX_NEW_TOKENS: int = 260    # WhatsApp-friendly; room for full course lists / overview answers
+    # Tamil/Thanglish replies need ~3–4 tokens per word in the Llama
+    # tokenizer, so 260 tokens cuts mid-sentence on multi-line Tamil
+    # answers. 600 keeps replies WhatsApp-short (system prompt enforces
+    # 3–5 lines) while leaving headroom for completion in any language.
+    MAX_NEW_TOKENS: int = 600
 
     # ── Follow-Up Automation (within 24-hour WhatsApp window) ─────
     FOLLOWUP_STAGE1_DELAY: int = 1800        # Seconds before 1st follow-up (30 min)

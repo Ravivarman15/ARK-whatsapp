@@ -236,6 +236,11 @@ TAMIL_WORDS = [
     "enakku", "paiyan", "ponnu", "neenga",
     "eppadi", "ethuku", "yen", "ipo",
     "chumma", "kashtam", "marikku",
+    # Common Thanglish small-talk tokens — without these, single-word
+    # Tamil greetings ("vanakkam") get classified as English and the
+    # bot replies in the wrong language.
+    "vanakkam", "vanakam", "vannakam", "namaskaram",
+    "nandri", "sari", "seri", "sariya", "venum", "venam",
 ]
 
 # Tamil Unicode range (basic)

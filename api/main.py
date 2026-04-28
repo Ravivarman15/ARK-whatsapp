@@ -77,6 +77,7 @@ from rag.segmentation import detect_segment_from_message
 from rag.persona_detector import detect_and_update_persona, get_persona
 from rag.intent_router import classify_message, Route
 from rag.response_formatter import format_whatsapp_response
+from rag.greeting_handler import detect_small_talk, get_small_talk_reply
 
 # =====================================================================
 # Logging
@@ -626,7 +627,27 @@ async def _process_incoming_message(payload: dict) -> None:
             return
 
         # =============================================================
-        # PRIORITY 3: Multi-Intent → answer via RAG, then start qual
+        # PRIORITY 3: Small Talk → friendly canned reply, no RAG
+        # =============================================================
+        # "hi", "hello", "good morning", "thanks", "ok", "super", "bye"…
+        # Without this, the message falls through to the general RAG
+        # branch, TF-IDF returns zero chunks for a greeting, and the
+        # user gets the unhelpful NO_CONTEXT_MSG fallback.
+        if route == Route.SMALL_TALK:
+            kind = detect_small_talk(message)
+            reply = get_small_talk_reply(kind, message) if kind else (
+                "Hello! \U0001f44b How can I help you today?"
+            )
+            if phone:
+                await send_whatsapp_message(phone, reply)
+            logger.info(
+                "AI_RESPONSE | phone=%s | type=small_talk | kind=%s | response=\"%s\"",
+                phone, kind.value if kind else "unknown", reply[:80],
+            )
+            return
+
+        # =============================================================
+        # PRIORITY 4: Multi-Intent → answer via RAG, then start qual
         # =============================================================
         # User mixed a question with an explicit admission verb, e.g.
         # "I want to join NEET, what are fees?". Answer first so they
