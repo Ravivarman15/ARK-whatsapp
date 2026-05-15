@@ -7,8 +7,9 @@ Exposes:
   - send_whatsapp_message(phone, message) — session text send (needs
     an open 24h customer-care window with the recipient).
   - send_admin_alert(phone, message)      — template send via the
-    pre-approved UTILITY `admin_alerts` template, with retry + safe
-    text fallback. Use this for system alerts (admin notifications,
+    pre-approved UTILITY template named in `AISENSY_ADMIN_ALERT_TEMPLATE`
+    (set in Render env), with retry + safe text fallback. Use this for
+    system alerts (admin notifications,
     hot-lead pings, qualified-lead summaries) — it works outside the
     24h window because WhatsApp allows approved templates anytime.
 
@@ -195,7 +196,7 @@ async def send_admin_alert(phone: str, message: object) -> AdminAlertResult:
     """
     Deliver a WhatsApp admin alert via the AiSensy Project Messages API
     using a pre-approved UTILITY template (name from
-    ``AISENSY_ADMIN_ALERT_TEMPLATE``, default ``admin_alerts``).
+    ``AISENSY_ADMIN_ALERT_TEMPLATE`` env var — no code default).
 
     Why this shape
     --------------
@@ -257,7 +258,7 @@ async def send_admin_alert(phone: str, message: object) -> AdminAlertResult:
         logger.error("ADMIN_ALERT_BLOCKED | reason=%s", err)
         return AdminAlertResult(False, None, "blocked", err)
 
-    template_name = (s.AISENSY_ADMIN_ALERT_TEMPLATE or "admin_alerts").strip()
+    template_name = (s.AISENSY_ADMIN_ALERT_TEMPLATE or "").strip()
     if not template_name:
         err = "AISENSY_ADMIN_ALERT_TEMPLATE is empty"
         logger.error("ADMIN_ALERT_BLOCKED | reason=%s", err)

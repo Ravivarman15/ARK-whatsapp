@@ -256,18 +256,18 @@ async def _deliver_admin_message(
     context: str,
 ) -> bool:
     """
-    Deliver a message to the admin via the AiSensy Project Messages API
-    using a pre-approved UTILITY template (``admin_alerts`` by default).
+    Deliver an admin alert via the AiSensy Project Messages API using the
+    pre-approved UTILITY template named in the ``AISENSY_ADMIN_ALERT_TEMPLATE``
+    env var (body has a ``{{1}}`` slot that renders the full multi-line
+    lead summary).
 
-    Previously this routed through the Campaign API, which produced
-    high dashboard failure rates on 1:1 transactional alerts. All admin
-    alerts (escalations, hot leads, qualified-lead summaries) now share
-    the Project API path with retry + safe text fallback — see
-    ``rag.whatsapp_sender.send_admin_alert`` for the full strategy.
+    See ``rag.whatsapp_sender.send_admin_alert`` for retry / sanitizer /
+    session-text-fallback details.
     """
     from rag.whatsapp_sender import send_admin_alert
 
-    ok = await send_admin_alert(admin_phone, message)
+    result = await send_admin_alert(admin_phone, message)
+    ok = bool(getattr(result, "ok", result))
     if ok:
         logger.info("ADMIN_NOTIFIED | %s", context)
     else:
